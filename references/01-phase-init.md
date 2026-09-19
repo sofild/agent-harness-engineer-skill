@@ -65,6 +65,18 @@ CLI参数 > Feature Flag > Policy规则 > Managed配置 > Local覆盖 > Project�
 2. 逐级合并（浅合并 + 深层合并选择策略）
 3. 来源追踪（每个配置值记录来源，便于调试）
 
+### Principle 5: Progressive Disclosure — 能力的按需加载
+
+Agent Skills 已成为开放标准：**2025-12-18 发布于 agentskills.io**，现由 **Linux Foundation 的 Agentic AI Foundation** 治理，约 **40 个产品**支持（Claude Code、Codex、Cursor 2.4、Gemini CLI、GitHub Copilot、VS Code、Goose、OpenCode 等）。
+
+其**核心架构契约是渐进式披露（progressive disclosure）**：携带一整个技能库几乎不消耗上下文，因为系统只在判定相关时才读正文。这正是本项目生成的 Agent 应当内建 skills 机制的理由——让能力可插拔、可扩展，却不让每个 skill 常驻上下文。三个层级：
+
+- **索引层**：启动时只加载每个 skill 的 `name` + `description`（每个约 50-100 token）
+- **命中层**：判定相关后才读取 skill 正文
+- **资源层**：`scripts/` `references/` `assets/` 最后按需加载
+
+> 本项目自身即 SKILL.md 格式，因此必须教被生成的 Agent 如何支持 skills 与渐进式披露（详见下方「Agent Skills 渐进式披露与 AGENTS.md 定位」章节）。
+
 ---
 
 ## Abstract Interface
@@ -124,6 +136,139 @@ CLI参数 > Feature Flag > Policy规则 > Managed配置 > Local覆盖 > Project�
 | `scripts/` | 运维工具 | 按需增删 | **保持不变** | 跟踪 |
 
 **⚠ AI构建提示**：根据用户选择的规模和技术栈，生成完整的目录树（包括所有必要的文件占位符）。参考 below 的三级结构描述，但需根据具体用途（编码助手 / 运维 / 数据分析）调整 `src/` 下的子模块划分。
+
+---
+
+## Agent Skills 渐进式披露与 AGENTS.md 定位
+
+**何时读本节**
+当生成的 Agent 项目需要决定以下三件事时阅读：① 是否在仓库根目录生成 AGENTS.md / CLAUDE.md；② `skills/` 目录应如何被加载而不撑爆上下文；③ skill 来源的可信度如何管控。本项目自身即 SKILL.md 格式，因此**必须教被生成的 Agent 如何支持 skills 与渐进式披露**。
+
+### 技术依据：Agent Skills 已成为开放标准
+
+- Agent Skills 规范于 **2025-12-18 发布于 agentskills.io**，现由 **Linux Foundation 的 Agentic AI Foundation** 治理，约 **40 个产品**支持（Claude Code、Codex、Cursor 2.4、Gemini CLI、GitHub Copilot、VS Code、Goose、OpenCode 等）。
+- 规范**只要求两个 frontmatter 字段**：`name` 与 `description`；且 `description` 是触发匹配（命中）的**唯一依据**。
+- **渐进式披露是核心架构契约**：携带一整个技能库几乎不花上下文，因为系统只在判定相关时才读正文。这正是本项目生成的 Agent 内建 skills 机制的理由——能力可插拔、可扩展，却不让每个 skill 常驻上下文。
+- **AGENTS.md 与 skill 互补**：AGENTS.md 是"给 Agent 的 README"（仓库级持久指令，6 万+ 仓库在用），它可以告诉 Agent "该去找哪个 skill"。
+
+### 三者层次：skill / 工具 / AGENTS.md
+
+| 角色 | 职责 | 是否常驻上下文 |
+|------|------|---------------|
+| **skill** | 教 Agent "怎么做"（方法、流程、领域知识） | 否，按需加载正文 |
+| **MCP / 原生工具** | 提供"能力"（执行动作、访问外部系统） | 否，调用时激活 |
+| **AGENTS.md** | 给"持久约束"（这个项目怎么动） | 是，仓库级持久加载 |
+
+> 详细层次与边界说明见 `references/08-core-concepts.md` 的对应小节。
+
+### AGENTS.md / CLAUDE.md 生成规范
+
+根目录的 AGENTS.md（在 Claude Code 等宿主中也称 CLAUDE.md）是"给 Agent 的 README"，写仓库级**持久指令**。
+
+**放什么**（仓库级持久约束）：
+- 构建 / 测试 / lint 命令
+- 目录约定与"系统区 vs 用户区"边界
+- 禁区（哪些文件 / 路径不可改）
+- 代码风格与关键架构约束
+
+**不放什么**（细节交给 skill 或 docs 按需加载）：
+- 完整 API 文档
+- 大段示例代码
+- 与具体任务强相关的长流程说明
+
+**与 system prompt 如何分工**：
+- `system prompt` = 运行时角色设定（"你是谁、怎么思考"），由宿主在每次会话注入
+- `AGENTS.md` = 仓库级持久约束（"这个项目怎么动"），被加载后相当于持久化的项目上下文
+- 二者正交：system prompt 换项目不变，AGENTS.md 换项目才变
+
+**三档差异表**：
+
+| 维度 | Minimal | Professional | Enterprise |
+|------|---------|--------------|------------|
+| 内容 | 构建/测试/lint 命令 + 目录约定 + 禁区 | 以上 + 关键架构约束 + skill 索引说明 | 以上 + 多环境约定 + 合规/审计约束 + submodule 边界 |
+| 体积 | < 100 行 | 100-300 行 | 300-600 行 |
+| 是否引用 skills | 可选 | 推荐（指明"该去找哪个 skill"） | 必须 |
+
+### skills/ 渐进式披露加载器契约（三级）
+
+```
+索引加载 (catalog)       启动 → 仅加载每个 skill 的 name + description (约 50-100 token/个)
+        │
+        ▼
+命中加载 (activate)      判定 query 与 description 相关 → 读 SKILL.md 正文
+        │
+        ▼
+资源加载 (load_resource)    按需读 scripts/ references/ assets/ (最后才读)
+```
+
+**加载器抽象接口（带 token 预算约束）**：
+
+```python
+class SkillLoader:
+    """渐进式披露加载器 —— 抽象骨架，具体实现由 AI 按规模生成。"""
+
+    INDEX_BUDGET = 2_000      # 启动索引总 token 上限（约 20-40 个 skill）
+    HIT_BUDGET = 8_000        # 单轮命中加载正文 token 上限
+    RESOURCE_BUDGET = 4_000   # 单轮资源加载 token 上限
+
+    def catalog(self) -> list["SkillMeta"]:
+        """索引层：仅返回每个 skill 的 name + description。"""
+        raise NotImplementedError(
+            "AI: 扫描 skills/ 下每个子目录的 SKILL.md，解析 frontmatter 的 "
+            "name 与 description，返回轻量元数据列表；总 token 不得超过 INDEX_BUDGET。"
+        )
+
+    def activate(self, skill_name: str, query: str) -> "SkillBody":
+        """命中层：仅当 query 与 description 相关才读取正文。"""
+        raise NotImplementedError(
+            "AI: 用 description 做相关性匹配；命中后才读 SKILL.md 正文，"
+            "并截断到 HIT_BUDGET。description 是触发的唯一依据。"
+        )
+
+    def load_resource(self, skill_name: str, path: str) -> bytes:
+        """资源层：仅当正文显式引用时才按需读取 scripts/references/assets/。"""
+        raise NotImplementedError(
+            "AI: 仅在 skill 正文引用某资源时加载，单轮不超过 RESOURCE_BUDGET；"
+            "脚本执行须走权限门控，不得预授权 shell。"
+        )
+```
+
+**目录树示意**：
+
+```
+skills/
+└── code-review/
+    ├── SKILL.md          # 必须：name + description frontmatter + 正文
+    ├── scripts/          # 可选：可执行脚本（以宿主凭据运行）
+    ├── references/       # 可选：长文档（大段细节）
+    └── assets/           # 可选：模板 / 样例
+```
+
+**frontmatter 规范**（SKILL.md 开头 YAML）：
+
+```yaml
+---
+name: code-review          # 1-64 字符；仅 [a-z0-9-]；必须与父目录同名
+description: >             # 1-1024 字符；必须同时说清"做什么"与"何时用"
+  对 Git 改动做结构化代码评审，发现安全与风格问题。
+  当用户提交 PR、要求 review 代码、或 CI 触发评审时使用。
+---
+```
+
+**正文规模约束**：建议单 skill 正文 ≤ 500 行 / ~5000 token，超出请拆 skill 或下沉到 `references/`。
+
+### Skill 供应链安全提示
+
+> **核心认知**：skill 是"伪装成文档的可执行内容"。`references/` 可含 prompt injection，`scripts/` 以**宿主凭据**运行。
+
+**持有 skill ≠ 获得工具的授权**：某 skill 调用部署 / 数据库工具，仍需对该工具独立授权；加载 skill 不会、也不应自动授予其宿主权限。
+
+**推荐做法**：
+- **版本锁定**：skill 引用固定版本，不自动跟随 latest
+- **digest 校验**：加载前校验内容哈希，防止被篡改
+- **scripts 审阅**：执行前人工 / CI 审查 `scripts/` 内容
+- **禁止预授权 shell**：不为 skill 预先开放高危 shell 权限
+- **信任门控**：新克隆仓库首次加载 skill 需显式确认
 
 ---
 
@@ -202,6 +347,25 @@ CLI参数 > Feature Flag > Policy规则 > Managed配置 > Local覆盖 > Project�
 - 版本号使用 caret/tilde 范围，不用固定版本
 - 按类别分组注释（# LLM / # Config / # Observability）
 - Node.js 项目需区分 dependencies 和 devDependencies
+
+### 提示 5: AGENTS.md / 根目录 Agent README 生成
+
+```
+你需要为生成的 Agent 项目在根目录生成 AGENTS.md（或 CLAUDE.md）。
+
+设计问题：
+1. 规模是什么？Minimal 仅放命令+禁区；Professional 加架构约束+skill 索引；
+   Enterprise 加多环境+合规约束
+2. 是否有 skills/？决定是否在 AGENTS.md 中列出"该去找哪个 skill"
+3. 是否有 CI？决定是否写 lint/test 命令
+
+生成要求：
+- 放仓库级持久指令：构建/测试/lint 命令、目录约定、禁区、代码风格
+- 不放完整 API 文档与大段示例（细节交给 skill 或 docs 按需加载）
+- 用简洁的指令句，不要写成教程；控制在规模对应体积内
+- 明确区分 system prompt（运行时角色）与 AGENTS.md（仓库级持久约束）
+- 详见上方「Agent Skills 渐进式披露与 AGENTS.md 定位」章节
+```
 ```
 
 ---
@@ -427,6 +591,14 @@ my-agent-platform/
 **原因**：目录生成时漏了 `.gitignore`，或 `.gitignore` 规则不完整。
 
 **修复**：`.gitignore` 必须在所有三个规模的 checklist 中作为强制性验收项。规则必须覆盖：环境文件、运行时目录、IDE 配置、OS 垃圾文件、Python/Node 缓存。
+
+### 陷阱 7: AGENTS.md 写成完整文档 / skills 全量加载
+
+**症状**：AGENTS.md 塞入整本 API 文档和大段示例，撑爆上下文；或 skills/ 下所有 SKILL.md 在启动时全量读入，导致上下文被无关 skill 占满。
+
+**原因**：混淆了"持久约束"（AGENTS.md 该放什么）与"按需知识"（skill / docs 该放什么）；忽略了渐进式披露的索引—命中—资源三级契约。
+
+**修复**：AGENTS.md 只放仓库级持久指令，细节交给 skill 或 docs 按需加载。skills 严格走 `catalog()`（仅 name+description）→ `activate()`（命中才读正文）→ `load_resource()`（最后才读脚本/参考）三级加载，并用 `INDEX_BUDGET` / `HIT_BUDGET` / `RESOURCE_BUDGET` 约束 token。加载 skill 时执行供应链安全检查（版本锁定 + digest 校验 + 信任门控）。
 
 ---
 

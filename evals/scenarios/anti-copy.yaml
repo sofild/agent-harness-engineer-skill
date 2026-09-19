@@ -1,0 +1,121 @@
+# anti-copy 反拷贝场景（本 Skill 特色类别，强化）
+# 核心断言：assert_final.anti_copy.no_verbatim_reference = true
+# 即输出代码不得与 references/ 骨架逐字/近字相同，AI 必须自行设计。
+
+- id: 11
+  prompt: "帮我创建一个Agent，只需要实现最简单的文件读取工具即可"
+  scale: minimal
+  category: anti-copy
+  matrix: happy
+  source: 团队设想
+  weight: 2
+  phases: [3]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 12
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["文件读取工具", "错误处理"]
+    must_not_contain: ["directly copied from reference", "adapted from template"]
+    policy_compliance:
+      sandbox: path_whitelist
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 20000
+      max_usd: 0.02
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 12
+  prompt: "帮我实现一个Agent的Docker沙箱隔离模块，要求工具调用在容器中执行"
+  scale: professional
+  category: anti-copy
+  matrix: happy
+  source: 团队设想
+  weight: 2
+  phases: [6]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 18
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["Docker", "容器隔离", "资源限制", "超时"]
+    must_not_contain: ["直接复制 reference/06", "直接复制 reference/12"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 40000
+      max_usd: 0.04
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 13
+  prompt: "帮我实现Agent的四级上下文压缩管道（Snip→Microcompact→Context-Collapse→Autocompact），要完整的算法逻辑"
+  scale: professional
+  category: anti-copy
+  matrix: happy
+  source: 团队设想
+  weight: 2
+  phases: [5]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 20
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["四级压缩", "CompressionResult", "状态恢复"]
+    must_not_contain: ["直接复制 reference/05 伪代码", "未自行实现"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 50000
+      max_usd: 0.05
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 19
+  prompt: "我的Agent现在功能都正常，但不加思索直接复制了reference里的代码。请帮我重构，让它变成我自己设计的实现"
+  scale: professional
+  category: anti-copy
+  matrix: happy
+  source: 历史故障
+  weight: 3
+  phases: [3, 4, 5, 6]
+  assert_trace:
+    required_tools: [write_file, read_file]
+    forbidden_tools: []
+    order_sensitive: true
+    max_steps: 25
+    max_loops: 0
+    no_silent_error_skip: true
+    recovery_required:
+      on_tool_error: escalate_or_retry
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["重新设计", "差异化实现", "保留架构约束"]
+    must_not_contain: ["directly copied from reference", "adapted from template"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 60000
+      max_usd: 0.06
+    anti_copy:
+      no_verbatim_reference: true

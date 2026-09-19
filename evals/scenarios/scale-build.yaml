@@ -1,0 +1,207 @@
+# scale-build 构建规模判定场景（Phase 1–4 相关）
+# 字段：id / prompt / scale / category / matrix / source / weight / phases
+#       / assert_trace（轨迹断言）/ assert_final（终态与合规断言）
+# 铁律：anti_copy.no_verbatim_reference 必须 true——AI 自行设计，禁止逐字复制 reference 骨架。
+
+- id: 1
+  prompt: "帮我构建一个Minimal规模的Agent（最简原型），只需要能读取文件、执行命令就行，不需要任何第三方库"
+  scale: minimal
+  category: scale-build
+  matrix: happy
+  source: 团队设想
+  weight: 1
+  phases: [1, 2, 3, 4]
+  assert_trace:
+    required_tools: []
+    forbidden_tools: [docker_run, firecracker_start]
+    order_sensitive: false
+    max_steps: 25
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["单文件或少文件结构"]
+    must_not_contain: ["pytest", "docker", "structlog"]
+    policy_compliance:
+      sandbox: path_whitelist
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 40000
+      max_usd: 0.04
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 2
+  prompt: "帮我构建一个Professional规模的Agent（生产级），要有完整的测试、日志、Docker沙箱和错误处理"
+  scale: professional
+  category: scale-build
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 1
+  phases: [1, 2, 3, 4, 5, 6, 7]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: [firecracker_start]
+    order_sensitive: false
+    max_steps: 40
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["src/ 分离结构", "四级压缩", "权限模型"]
+    must_not_contain: ["print(", "未做测试"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 90000
+      max_usd: 0.10
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 3
+  prompt: "帮我构建一个Enterprise规模的Agent（企业平台），需要全链路监控、微VM沙箱、多租户支持、CI/CD流水线"
+  scale: enterprise
+  category: scale-build
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 1
+  phases: [1, 2, 3, 4, 5, 6, 7]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 50
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["OpenTelemetry", "Firecracker", "多租户", "CI/CD"]
+    must_not_contain: ["print(", "无监控"]
+    policy_compliance:
+      sandbox: firecracker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 200000
+      max_usd: 0.25
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 4
+  prompt: "用Python快速做一个Agent原型，就最简单的版本，能跑就行"
+  scale: minimal
+  category: scale-build
+  matrix: happy
+  source: 团队设想
+  weight: 1
+  phases: [1, 2, 3, 4]
+  assert_trace:
+    required_tools: []
+    forbidden_tools: [docker_run, firecracker_start]
+    order_sensitive: false
+    max_steps: 20
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["Minimal", "最简原型"]
+    must_not_contain: ["pydantic", "structlog", "pytest"]
+    policy_compliance:
+      sandbox: path_whitelist
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 40000
+      max_usd: 0.04
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 5
+  prompt: "我需要构建一个团队内部使用的Agent系统，要能扩展、好维护、有测试覆盖"
+  scale: professional
+  category: scale-build
+  matrix: happy
+  source: 团队设想
+  weight: 1
+  phases: [1, 2, 3, 4, 5, 6, 7]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: [firecracker_start]
+    order_sensitive: false
+    max_steps: 40
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["可扩展", "测试覆盖", "src/ 分离"]
+    must_not_contain: ["最小实现", "无测试"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 90000
+      max_usd: 0.10
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 6
+  prompt: "帮我构建一个AI编码助手Agent，能够读取文件、执行命令、搜索代码。请帮我设计Agent架构并给出实现代码"
+  scale: professional
+  category: scale-build
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 1
+  phases: [1, 2, 3, 4, 5, 6, 7]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: [firecracker_start]
+    order_sensitive: false
+    max_steps: 45
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["7 个 Continue 站点", "四级压缩", "权限模型"]
+    must_not_contain: ["直接复制", "未做沙箱"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 100000
+      max_usd: 0.11
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 23
+  prompt: "我想用Node.js构建一个Professional Agent，支持多LLM供应商，包含完整的项目结构、测试和日志"
+  scale: professional
+  category: scale-build
+  matrix: happy
+  source: 团队设想
+  weight: 1
+  phases: [1, 2, 3, 4, 5, 6, 7]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: [firecracker_start]
+    order_sensitive: false
+    max_steps: 40
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["Node.js", "pino", "vitest", "供应商无关"]
+    must_not_contain: ["structlog", "pytest"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 90000
+      max_usd: 0.10
+    anti_copy:
+      no_verbatim_reference: true

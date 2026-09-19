@@ -13,7 +13,7 @@ MCP（Model Context Protocol）定义了 AI 模型与外部工具、数据源之
 
 ---
 
-## 六种传输协议选择指南
+## 传输协议选择指南（stdio 本地默认 / Streamable HTTP 远程默认）
 
 每种传输协议有不同的适用边界。选错协议会导致性能问题或架构耦合：
 
@@ -33,21 +33,36 @@ MCP（Model Context Protocol）定义了 AI 模型与外部工具、数据源之
 
 **启动参数模式**：通过命令 + 参数指定 Server 可执行文件路径，环境变量注入配置。
 
-### HTTP + SSE（Server-Sent Events）
+### Streamable HTTP（远程默认）
 
-**工作原理**：HTTP 承载请求，SSE 承载 Server 到 Client 的推送（如资源变更通知）。这是远程 MCP 的标准选择。
+**工作原理**：基于单一 HTTP 端点（POST 请求 + 可选的可恢复 SSE 流）承载 MCP 会话。Client 通过普通 HTTPS 与 Server 通信，Server 可借助标准反向代理、负载均衡器与 CDN 横向扩展。这是 **2026 年远程 MCP 的推荐默认传输**，已取代 HTTP+SSE。
 
 **何时选择：**
-- 远程服务（跨网络 / 跨数据中心）
-- 需要负载均衡（多个 Client 共享同一个 Server 集群）
+- 远程服务（跨网络 / 跨数据中心）—— 远程场景的**默认首选**
+- 需要负载均衡（多个 Client 共享同一个 Server 集群，无状态端点易于水平扩展）
 - Server 需要独立部署和运维（不随 Client 生命周期绑定）
-- 需要 Server 主动推送事件（资源更新、告警）
+- 需要 Server 主动推送事件（通过同一会话内的可恢复 SSE 流）
+- 与现有 Web 基础设施（OAuth、网关、WAF）无缝对接
 
 **何时避免：**
-- 本地场景：HTTP 引入不必要的网络栈复杂度和延迟
-- 对延迟极度敏感（~1ms 级别）：HTTP 的 TCP 握手和 Header 开销不可忽略
+- 本地场景：引入不必要的网络栈复杂度和延迟，此时应优先 stdio
+- 需要真正的全双工双向消息（Client 也要在无请求时主动推给 Server）—— 选 WebSocket
 
-**关键设计要点**：HTTP 端点接收请求并返回初始响应，SSE 长连接保持打开用于推送后续更新。
+**关键设计要点**：单个 POST 端点接收 JSON-RPC 请求；Server 通过 `text/event-stream` 在同一会话回传流式响应；会话状态经 `Mcp-Session-Id` 头关联，断线后可恢复，无需长久存活的 SSE 连接。
+
+### HTTP + SSE（Server-Sent Events）⚠ 遗留兼容
+
+> **状态：已由 Streamable HTTP 取代，仅保留用于遗留 Server 兼容。** 新项目一律使用 Streamable HTTP；仅在对接尚未升级的老 Server 时临时启用。
+
+**工作原理**：HTTP 承载请求，SSE 长连接承载 Server 到 Client 的推送（如资源变更通知）。曾是远程 MCP 的标准选择，现已由 Streamable HTTP 接替。
+
+**何时选择（仅遗留）：**
+- 对接尚未支持 Streamable HTTP 的老旧 MCP Server
+- 无法升级、且强依赖"独立 SSE 长连接推送"的既有部署
+
+**何时避免：**
+- 所有新开发：开销更高（需维护一条常驻 SSE 连接），且缺乏 Streamable HTTP 的会话可恢复性与横向扩展能力
+- 对延迟极度敏感（~1ms 级别）：HTTP 的 TCP 握手和 Header 开销不可忽略
 
 ### WebSocket
 
@@ -98,11 +113,128 @@ MCP（Model Context Protocol）定义了 AI 模型与外部工具、数据源之
   │         ├── 是 → WebSocket
   │         └── 否 → 需要 protobuf 契约？
   │                   ├── 是 → gRPC
-  │                   └── 否 → HTTP + SSE
+  │                   └── 否 → Streamable HTTP（远程默认；HTTP+SSE 仅遗留兼容）
   └── 否 → 需要安全隔离？
-            ├── 是 → stdio（子进程隔离）
+            ├── 是 → stdio（本地默认，子进程隔离）
             └── 否 → Local（同进程函数调用）
 ```
+
+---
+
+## MCP 治理现状与协议基线
+
+**何时读本节**：当你要确认"我们用的 MCP 是哪个版本、归谁管、能力怎么协商、工具太多怎么检索"这些协议级事实时。
+
+### 治理现状
+
+- **归属**：MCP 于 **2025-12-09** 捐赠给 **Linux Foundation 的 Agentic AI Foundation**（与 Agent Skills 同一治理主体；Agent Skills 规范见 `references/01-phase-init.md`）。
+- **意义**：协议不再由单一厂商控制，spec 演进经开放治理流程，跨厂商互操作性更有保障。
+- **实践提示**：选型时优先支持"已捐给基金会"的标准能力，避免锁定某厂商私有扩展。
+
+### spec 版本基线
+
+- 以 `initialize` 握手中协商的 `protocolVersion` 为基线，Client 与 Server 取双方支持的交集。
+- Harness 应记录实际协商到的版本号到 Session 日志，便于事后审计"当时用的是哪版协议"。
+- **铁律**：不假设 Server 支持最新私有字段；任何可选能力使用前必须先经能力协商确认。
+
+### 能力协商（capabilities）
+
+```
+initialize 握手（抽象，非可运行）：
+  Client ──→ initialize(protocolVersion, capabilities{tools, resources, prompts, ...})
+  Server ──→ InitializeResult(protocolVersion, capabilities{...}, serverInfo)
+  双方取 capabilities 交集 → 仅启用协商通过的能力
+  例：Server 未声明 resources → Client 不调用 resources/read
+```
+
+### tool search（工具检索，2026 关注点）
+
+- **问题**：把成百上千个 MCP 工具的完整 schema 全部注入 system prompt，会撑爆上下文并抬高 token 成本（详见 `references/08-core-concepts.md` 的 Prompt Cache 稳定性机制）。
+- **方向**：从"全量注入"转向"按需检索"——Client 先拿到工具索引（name + description），按当前任务语义检索相关工具，命中后才拉取完整 schema 注入。
+- **落地**：能力协商阶段确认 Server 是否支持工具检索接口；不支持时退化为分层注入（内置工具稳定前缀 + MCP 工具追加在缓存边界之后，见 08）。
+
+---
+
+## A2A / AG-UI 定位与选型
+
+**何时读本节**：当你在"MCP 之外，还要不要接 A2A 或 AG-UI"之间犹豫时。
+
+### 三者分工
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  MCP   → Agent 连「工具与数据」   (tool / resource / prompt) │
+│  A2A   → Agent 连「Agent」       (跨进程智能体协作)         │
+│  AG-UI → Agent 连「用户前端」     (流式 UI 事件 / 人机界面)   │
+└─────────────────────────────────────────────────────────┘
+```
+
+| 协议 | 连接两端 | 解决的核心问题 | 典型场景 |
+|------|----------|----------------|----------|
+| **MCP** | Agent ⇄ 工具 / 数据源 | 标准化"调能力、读数据" | 文件系统、数据库、第三方 API、CI |
+| **A2A** | Agent ⇄ Agent | 跨进程 / 跨组织的智能体协作与任务委派 | 多厂商 Agent 组网、长任务委派 |
+| **AG-UI** | Agent ⇄ 前端（React 等） | 把 Agent 的流式输出 / 状态映射成 UI 事件 | 聊天界面、表单填答、人工介入面板 |
+
+### 选型原则：大多系统只需"MCP + 三者之一"
+
+**不要三个全上。** 绝大多数生产系统只需要 MCP，再叠加 A2A 或 AG-UI 中的**一个**：
+
+- 你的 Agent 只和工具 / 数据打交道 → **仅 MCP** 足够。
+- 你的 Agent 要和其他 Agent 协作（跨进程、跨团队、跨厂商）→ MCP + **A2A**。
+- 你的 Agent 要驱动一个富前端界面（流式渲染、人工介入控件）→ MCP + **AG-UI**。
+- 同时需要"Agent 间协作"和"前端驱动"的极少数场景，才考虑三者并用——且应先确认前两者各自带来的复杂度是否必要。
+
+### 与 `references/09-multi-agent.md` 的对接
+
+09 的两种跨进程拓扑走 A2A 最自然：
+
+```
+Coordinator 模式（中心化）：
+  Coordinator Agent ──A2A──> Worker Agent（独立进程 / 独立地址）
+  任务委派、结果回收走 A2A 的 task/message 协议，而非同进程函数调用
+
+Swarm 模式（去中心化）：
+  多个 Peer Agent 经 A2A 消息总线对等通信（TaskProposal / ResultShare / ConsensusVote）
+  09 的 MessageBus 抽象可直接映射为 A2A 的 transport
+```
+
+- **进程内多 Agent**（09 的 Minimal / Professional 同进程子 Agent）：**不需要 A2A**，直接函数调用 / 消息总线即可，引入 A2A 是过度工程。
+- **跨机器 / 跨组织多 Agent**（09 的 Enterprise Coordinator + Swarm）：用 **A2A** 承载 Agent 间通信，MCP 仍负责每个 Agent 内部的工具与数据；AG-UI 仅在需要把协作过程呈现给用户时才引入。
+
+> 与 `references/09-multi-agent.md` 联动：A2A 是 09 拓扑循环的"跨进程 transport 实现选项"，不改变 09 的 Coordinator / Swarm 决策逻辑。
+
+---
+
+## MCP 供应链与命令注入风险
+
+**何时读本节**：当你要把第三方 MCP Server 接进生产、又不想因为"它只是个工具"而放松警惕时。
+
+### 风险事实
+
+- **OS 命令注入暴露 API Key**：已有流行 MCP Server 被曝存在 OS 命令注入漏洞——攻击者通过构造的工具参数触发 Server 执行任意 shell 命令，进而读取并外传宿主机上的 API Key / 凭证。
+- **供应链不可信**：MCP Server 本质是"以宿主凭据运行的外部代码"（与 `references/01-phase-init.md` 的 Skill 供应链风险同源：skill 也是"伪装成文档的可执行内容"）。来源不明或未锁版本的 Server 可能夹带恶意逻辑。
+- **信任 ≠ 验证**：即便 Server 来自"可信厂商"，其运行时的行为仍需被验证，而非默认放行。
+
+### 缓解分层
+
+```
+1. 隔离域（见 references/12-sandbox-advanced.md）
+   └─ MCP Server 运行在独立隔离域（独立沙箱 / 微 VM），不共享 Agent 主进程命名空间
+2. 最小权限
+   └─ Server 仅能访问其声明的工具所需资源；网络出站默认 deny（06 的 Layer 4）
+3. 凭证外置
+   └─ API Key 不进入 Server 进程环境，由宿主经 06 的 credentials_request 注入
+4. 默认 ask / 显式授权
+   └─ 第三方 MCP 工具默认 level: ask（06 的陷阱 5；08 的 human_required 语义）
+5. 供应链校验
+   └─ 版本锁定 + digest 校验 + 信任门控（见 01 的 Skill 供应链安全提示）
+```
+
+### 关键认知：微 VM 隔离解决「爆炸半径」，不解决「信任与验证」
+
+- microVM（Firecracker / microsandbox）等硬件级隔离，把**单个 Server 被攻破后的影响范围**限制在它自己的 VM 内——这是「爆炸半径」控制，非常有价值。
+- 但它**不能**告诉你"这个 Server 本身是否可信、它的输出是否该被相信"。信任与验证必须由 `references/04-phase-agent-loop.md` 的**验证回路**（Verifier / CONTINUE-SITE-8）和权限模型兜底。
+- 结论：隔离是必要条件，不是充分条件。MCP Server 必须"独立隔离域 + 默认 ask + 验证回路"三件套齐备。
 
 ---
 
@@ -347,6 +479,20 @@ InvalidParams           → "工具 X 参数错误：{具体字段}格式不正�
 StaleCache              → "工具 X 返回了过期缓存结果：正在重新获取最新数据"
 ```
 
+### MCP 错误 → ErrorKind 映射（与 `references/08-core-concepts.md` 对齐）
+
+所有 MCP 层错误先 `classify_error → ErrorKind`（08 的五类：`retryable` / `fatal` / `degrade` / `replan` / `human_required`），再按处理契约分流。下表是 MCP 特有的五种典型错误归属：
+
+| MCP 错误场景 | ErrorKind | 处理契约 | 说明 |
+|--------------|-----------|----------|------|
+| 连接超时（Connect Timeout） | `retryable` | 立即重试（带退避），耗尽升级 `fatal` | 瞬时网络抖动；退避上限受 06 的 Budget 约束 |
+| 熔断（Circuit Breaker OPEN） | `retryable`（冷却后自愈；持续 OPEN 升级 `human_required`） | 冷却窗口到期自动半开试探 | 属"暂时不可用"，非结构性失败；长期不恢复说明 Server 失联需人工 |
+| ToolNotFound | `human_required` | 挂起等待，不自动推进 | 工具注册 / 配置错误，重传同等参数必败；需人工修正 Server 注册 |
+| AuthError | `human_required` | 挂起等待，重新授权 | 凭证失效需重新 OAuth / 换 Token；盲重试凭证无意义（见 OAuth 节） |
+| InvalidParams | `replan` | 回到 Planner 重新生成合规参数 | 参数契约不符，同等参数重试必败；交由 Planner 重构调用 |
+
+> 与 08 的「散文式错误 → ErrorKind 映射表」同源：permission deny（06 权限决策）→ `human_required`，不在 `retryable` 集合内。MCP 工具的 `idempotent` 声明决定副作用类错误能否安全重试（见 08 的「幂等性要求」）。
+
 ---
 
 ## 规模适应性指南
@@ -362,7 +508,7 @@ StaleCache              → "工具 X 返回了过期缓存结果：正在重新
 
 ### Professional（专业级）
 
-- stdio + HTTP/SSE 双协议支持
+- stdio + Streamable HTTP 双协议支持（HTTP+SSE 仅遗留兼容）
 - 连接池：min 2, max 5
 - 资源生命周期：discover → subscribe → read（无自动更新推送）
 - 工具发现缓存：Level 1 内存缓存（会话级）
@@ -372,7 +518,7 @@ StaleCache              → "工具 X 返回了过期缓存结果：正在重新
 
 ### Enterprise（企业级）
 
-- 全部 6 种传输协议可选
+- 全部传输协议可选（Streamable HTTP 远程默认；HTTP+SSE 仅遗留兼容；stdio 本地默认）
 - 连接池：动态伸缩，基于负载自适应
 - 电路断路器：完整三状态实现
 - 资源生命周期完整 + Server 推送实时更新

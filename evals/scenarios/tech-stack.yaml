@@ -1,0 +1,147 @@
+# tech-stack 技术栈选型场景（Phase 1/4/7 相关）
+# 铁律：anti_copy.no_verbatim_reference 必须 true。
+
+- id: 7
+  prompt: "给我的Professional Agent加上完整的日志系统，要结构化输出，能方便后续搜索和分析"
+  scale: professional
+  category: tech-stack
+  matrix: happy
+  source: 团队设想
+  weight: 1
+  phases: [7]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 15
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["structlog", "结构化日志", "JSON"]
+    must_not_contain: ["print(", "OpenTelemetry"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 30000
+      max_usd: 0.03
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 8
+  prompt: "集成OpenTelemetry做全链路追踪，我要监控每个Tool调用的延迟、每次LLM请求的Token消耗"
+  scale: enterprise
+  category: tech-stack
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 1
+  phases: [7]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 20
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["OpenTelemetry", "Span", "Prometheus", "trace_id"]
+    must_not_contain: ["仅 print", "无追踪"]
+    policy_compliance:
+      sandbox: firecracker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 50000
+      max_usd: 0.05
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 9
+  prompt: "用click做命令行接口，支持多子命令（init、run、test、config），自动生成--help文档"
+  scale: professional
+  category: tech-stack
+  matrix: happy
+  source: 团队设想
+  weight: 1
+  phases: [1, 4]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 15
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["click", "子命令", "init/run/test/config"]
+    must_not_contain: ["input(", "argparse"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 30000
+      max_usd: 0.03
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 10
+  prompt: "用typer+rich给我的Enterprise Agent做一个交互式TUI，有进度条、表格和彩色输出"
+  scale: enterprise
+  category: tech-stack
+  matrix: happy
+  source: 团队设想
+  weight: 1
+  phases: [1]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 15
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["typer", "rich", "Progress", "Table"]
+    must_not_contain: ["click", "print("]
+    policy_compliance:
+      sandbox: firecracker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 30000
+      max_usd: 0.03
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 24
+  prompt: "帮我构建一个Agent，要求使用OpenAI的GPT模型而不是Claude。需要支持streaming和token计数"
+  scale: professional
+  category: tech-stack
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 1
+  phases: [2]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 15
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["OpenAI", "streaming", "token 计数", "工厂模式"]
+    must_not_contain: ["硬编码 anthropic", "不支持供应商切换"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 30000
+      max_usd: 0.03
+    anti_copy:
+      no_verbatim_reference: true

@@ -319,13 +319,15 @@ Swarm 模式在以下条件同时满足时才优于 Coordinator：
 
 # 多 Agent 拓扑循环 (v4)
 
-> 配合 Phase 4 的 Loop Engineering 升级，引入三种标准的多 Agent 协作拓扑，形成可组合的"协作循环"。
+> 配合 Phase 4 的 Loop Engineering 升级，引入四种标准的多 Agent 协作拓扑（含 Evaluator 与对抗式验证），形成可组合的"协作循环"。
 
 ## 设计原理
 
 单个 Agent 的循环效能有天花板——推理深度、上下文窗口、单一视角都有不可逾越的局限。多 Agent 拓扑循环将多个 Agent 嵌套在一个更大的循环中，形成结构化协作。
 
-## 三种标准拓扑
+## 四种标准拓扑（含 Evaluator 与对抗式验证）
+
+> 选型总纲：**每个拓扑都是用额外 token 换更低的缺陷率**。是否值得，取决于"缺陷成本"——缺陷越贵（安全、关键决策、不可逆改动），越该上更重的拓扑。各拓扑的 **token 倍率与缺陷成本门槛** 见末尾「拓扑经济性对照表」（均为基于经验的估算，非实测基准）。
 
 ### 拓扑 1：Manager-Worker（管理者-工人）
 
@@ -338,7 +340,7 @@ class ManagerWorkerLoop:
     1. 分析任务，拆解为子任务
     2. 分配给 Worker（创建子循环）
     3. 收集结果，评估质量
-    4. 不满意则重新分配（最多 3 次）
+    4. 不满意则重新分配（最多 3 次，评估标准见下方「重分配评估标准」）
     """
 
     def __init__(self):
@@ -350,9 +352,24 @@ class ManagerWorkerLoop:
         # Step 1: 拆解任务
         # Step 2: 分配循环（支持重分配）
         # Step 3: 质量评估
-        # Step 4: 不满意则重新分配
+        # Step 4: 不满意则重新分配（最多 3 次，见下方评估标准）
         ...
 ```
+
+**重分配评估标准（最多 3 次改派，避免无限空转）**
+
+Manager 不能在"感觉不对"时就重分配——必须有可判定的标准，否则会陷入改派循环。三档判定如下：
+
+| 判定维度 | 算失败（触发重分配） | 什么情况下改派（换 Worker） | 什么时候升级人工（`human_required`） |
+|---------|---------------------|----------------------------|--------------------------------------|
+| 输出正确性 | 子任务产物未通过确定性验证（compile/lint/test 失败，见 `references/04-phase-agent-loop.md` 的 CONTINUE-SITE-8） | 同一 Worker 第 1–2 次产出不合格，但其 profile 与该子任务匹配 → 清空上下文重试，给一次修正机会 | 同一子任务 **连续 3 次** 重分配后仍不达标 → 不再改派，标记 `human_required`，交人工 |
+| 范围契合度 | 产物解决了错误子任务（偏离 subtask 描述） | 子任务描述本身有歧义 → 回到 Step 1 重新拆解并改派，而非惩罚 Worker | 重分配耗尽且拆解已澄清仍失败 → 升级人工复查任务规格 |
+| 资源/超时 | 单次 Worker 执行超过预算阈值（token 或 wall-clock） | 换用更轻量 profile 的 Worker 重试 | 预算内无法完成 → 升级人工决定是否拆分/降标 |
+
+**关键约束**：
+- 重分配计数 **按子任务独立**——一个子任务失败不影响其他子任务的分配额度。
+- 每次重分配前必须先把**结构化失败定位**（文件路径 + 行号 + 错误码，来自 Verifier 的 `machine_readable_output`）作为新 subtask 的上下文注入，而不是"再做一次"。
+- 第 3 次失败后**禁止自动重试**——必须走 `human_required`，否则违反「不自评」与「不空转」铁律（连续失败说明任务规格或能力边界问题，Agent 无法自愈）。
 
 ### 拓扑 2：Generator-Critic（生成-批评-修正）
 
@@ -378,6 +395,17 @@ class GeneratorCriticLoop:
         yield FinalResponseEvent(text=output)
 ```
 
+**Critic 构造约束（与拓扑 4 Evaluator 统一口径）**
+
+Generator-Critic 的 Critic 不是"另一个会聊天的 Agent"，而是与 Evaluator 同构的**独立校验者**。两处口径必须一致，避免 AI 在两套规则间摇摆：
+
+- **temperature 固定 0.0–0.1**：Critic 做确定性评分，不做创造性发散；与 Evaluator 的 rubric 打分共用同一温度区间。
+- **独立上下文**：Critic 不继承 Generator 的消息历史（看不到 Generator 的推理过程），从空白 `messages` 启动，只接收 `output` + `task` 作为评估输入——这正是 Evaluator 约束 ①。
+- **结构化输出**：`{score, feedback, evidence}`——`score` 用于 PASS/FAIL 判定（阈值建议 ≥0.9），`feedback` 回喂 Generator，`evidence` 给出扣分依据（与 Evaluator 的 evidence/counter-proposal 同构）。
+- **禁止 self-verify**：Critic 与 Generator 必须是两个独立 Agent 实例，Generator 不得调用自身的 `_critic` 给自己打分。
+
+> 与 Evaluator 的差别仅在于**循环位置**：Critic 嵌在生成-修正内环里反复迭代，Evaluator 是一次性独立评审（见拓扑 4）。二者共享"独立上下文 + 低温度 + rubric + 结构化输出"的底层构造。
+
 ### 拓扑 3：Debate（多 Agent 辩论）
 
 多个 Agent 并行独立回答，然后互相辩论多轮，最后裁判 Agent 汇总。
@@ -399,19 +427,159 @@ class DebateLoop:
         ...
 ```
 
+### 拓扑 4：Evaluator（独立评估子 Agent）★v4 新增
+
+**何时读本节**：当你发现「让 coding agent 复查自己的输出，它会用写出那个 bug 时同样的流畅自信给自己打及格」这一问题时，用本节把评估者强制独立出来。本节对应 `references/04-phase-agent-loop.md` 中 Verifier 的「推断型」分支——但 04 的 Verifier 主体是**计算型**（compile/lint/test），Evaluator 是**推断型**（无法代码化的主观维度），二者分工见下方「与 04 确定性验证的分工表」。
+
+**技术依据（为什么必须独立）**
+
+Agent 一致性高估自己的产出，尤其在主观任务上——让它复查自己的输出，它会用写出 bug 时同样的流畅自信给自己打及格。Anthropic 的解法是把 **Planner（把意图展开为规格）→ Generator（实现）→ Evaluator（用 few-shot 校准过的评分标准打分）** 强制分离。**Evaluator 不持有 Generator 的推理记忆、对它的选择没有投入、有 rubric 而非感觉**——"这是被重建为结构的 code review"。代价是每个工作单元多跑一个 Agent，是否值得取决于缺陷成本。实测对照：solo agent 做复古游戏机项目花了 9 小时但失败；加上 Evaluator 子 agent 的完整 harness 跑了 6 小时，产出了可工作的软件。
+
+**四条构造约束（硬性，缺一不可）**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Evaluator 子 Agent（独立上下文，从空白 messages 启动）         │
+│                                                              │
+│  输入：artifact（Generator 产物）+ rubric + few-shot 样本       │
+│        ❌ 不接收 Generator 的对话历史 / 推理轨迹               │
+│                                                              │
+│  处理：按 rubric 维度逐项打分（含阈值）                         │
+│        对照 few-shot 校准「这一档大概长什么样」                  │
+│                                                              │
+│  输出：{                                                     │
+│    score:        各维度得分（0-1 或等级）                     │
+│    evidence:     每条扣分的定位与依据（文件/行/段落）          │
+│    counter_proposal: 若不及格，给出"应该怎么改"的反提案       │
+│  }                                                           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- **约束 ① 独立上下文**：Evaluator 不继承 Generator 的消息历史，从空白 `messages` 启动，只接收 `artifact` + `rubric` + `few-shot` 作为评估输入。它看不到 Generator"为什么这么写"，因此没有沉没成本带来的偏袒。
+- **约束 ② 显式 rubric**：评分标准必须前置定义，含**评分维度**（如正确性、可读性、架构契合、安全语义）与**每维度的阈值/档位**（如 `correctness ≥ 0.8 且 security == pass` 才算合格）。没有 rubric 的"I'll review it"只是换个角度的自评。
+- **约束 ③ few-shot 校准样本**：在系统提示中放 2–4 个「输入片段 + 期望评分 + 期望证据」的范例，把"这一档大概长什么样"锚定下来，降低评分方差，让 Evaluator 与人工评审标准对齐。
+- **约束 ④ 输出结构**：必须输出 `score + evidence + counter_proposal` 三元组——`score` 供 PASS/FAIL 判定，`evidence` 给出可定位的扣分依据，`counter_proposal` 在不及格时直接给出修正方向（避免只说"不行"却不给路）。
+
+```python
+class EvaluatorAgent:
+    """
+    独立评估子 Agent（推断型校验者）。
+
+    架构约束（铁律）:
+      - 不继承 Generator 的 messages 历史（约束①）
+      - 系统提示内嵌 rubric（维度 + 阈值）与 few-shot 校准样本（约束②③）
+      - 输出必须含 score / evidence / counter_proposal（约束④）
+      - 与 Generator 是两个独立实例：禁止 self-evaluate
+    """
+
+    def __init__(self, rubric: Dict[str, Any], few_shot: List[Dict[str, Any]]):
+        self.rubric = rubric          # 含维度与阈值
+        self.few_shot = few_shot      # 校准样本
+        # 注意：构造函数不接受 messages 参数（约束①）
+
+    async def evaluate(self, artifact: Any, task: str) -> Dict[str, Any]:
+        """
+        对 Generator 产物做独立评分。
+
+        Args:
+            artifact: Generator 产出的 artifact（代码 / 设计 / 决策草稿）
+            task:     原始任务描述（用于上下文对齐）
+
+        Returns:
+            {"score": {...}, "evidence": [...], "counter_proposal": "..."}
+        """
+        raise NotImplementedError("AI: 按 rubric 维度逐项打分，"
+                                   "对照 few-shot 校准档位，输出 "
+                                   "score + evidence + counter_proposal；"
+                                   "不得读取 Generator 的推理历史")
+```
+
+#### 对抗式验证（Adversarial Verification）变体
+
+Evaluator 的泛化形态：独立验证 Agent 被**明确提示去反驳一个发现，而非确认它**——它拿到的是"Generator 声称 X 成立"，任务是找出 X 不成立的证据，而不是验证 X 成立。这把「证实偏差」翻转成「证伪压力」。
+
+```
+常规 Evaluator:   拿到产物 → 评估"它好不好"      → 偏乐观（默认找通过理由）
+对抗式验证:       拿到主张 → 任务"推翻这个主张"  → 偏悲观（默认找反例）
+                  找不到反例 ⇒ 主张暂时站得住（负向确认）
+```
+
+**适用边界**
+
+| 适合用对抗式验证 | 不适合用对抗式验证 |
+|----------------|-------------------|
+| 安全审计（找漏洞而非证明无漏洞） | 延迟敏感任务（多跑一个对抗 Agent 直接加倍延迟） |
+| 设计评审（挑战架构假设的脆弱点） | 低缺陷成本任务（错别字、一次性脚本，重验证不值） |
+| 关键决策（上线/回滚/选型，错一次代价高） | 产出可逆且易重做的小改动 |
+| 任何「假阳性代价 < 假阴性代价」的场景 | 任何需要快速收敛的 exploratory 任务 |
+
+**构造要点**：对抗式验证仍须遵守 Evaluator 四条约束（尤其①独立上下文、④输出反提案）。它的 `counter_proposal` 不是"怎么改"，而是"主张为何站不住 + 最小的证伪证据"。
+
+### 与 04 确定性验证的分工表
+
+Evaluator（推断型）与 `references/04-phase-agent-loop.md` 的 Verifier（计算型）不是竞争关系，而是**两级闸门**：先算后推，能算的不推。
+
+| 维度 | 计算型验证（04 Verifier） | 推断型验证（09 Evaluator） |
+|------|--------------------------|---------------------------|
+| 判断者 | 编译器 / linter / test runner / schema validator | 独立 LLM 评估子 Agent |
+| 代表检查 | compile / lint / type / unit / schema / 安全扫描 | 可读性、架构契合、安全语义、设计合理性 |
+| 何时跑 | **优先且必须**——能代码化的先跑，便宜（毫秒~秒，近乎免费） | **仅当**该维度无法代码化时才跑，贵（多一次 LLM 调用） |
+| 确定性 | 确定（同输入同结果） | 概率（需 few-shot 校准降低方差） |
+| 是否最终评判 | 是（且应优先） | 否——只能作为辅助信号，不得单独放行 |
+| 不自评约束 | Generator 不得 `self.verify()` 自己产物 | Generator ≠ Evaluator，两个独立实例 |
+| 失败回喂 | `machine_readable_output`（文件+行+错误码）注入下一轮 | `score + evidence + counter_proposal` 注入下一轮 |
+
+**分工铁律**：
+1. **计算型优先**：能用 compile/lint/type/test 判定的，绝不交给 Evaluator——编译器自己知道结果，且确定、即时、免费。
+2. **推断型补漏**：Evaluator 只处理计算型覆盖不到的**主观维度**，且不得作为唯一放行条件（须与计算型门禁叠加）。
+3. **两者都不自评**：生成者既不能调自己的 Verifier，也不能当自己的 Evaluator——这是 04 与 09 共同遵守的硬约束。
+
 ## 拓扑选择指南
 
-| 拓扑 | Token 成本 | 质量提升 | 适用场景 |
-|------|-----------|---------|----------|
-| Manager-Worker | 中（子任务并行） | 中 | 大型多文件任务，有明确分工 |
-| Generator-Critic | 低（2x 调用） | 高 | 代码生成、文档写作 |
-| 多 Agent 辩论 | 高（N×M 轮） | 最高 | 安全审计、设计评审、关键决策 |
+| 拓扑 | Token 倍率* | 质量提升 | 缺陷成本门槛（低于此不上该拓扑） | 适用场景 |
+|------|-----------|---------|-------------------------------|----------|
+| solo（基线） | 1x | 基准 | 低——可逆、易重做、错一次代价小 | 简单查询、一次性脚本、探索性任务 |
+| Coordinator | 2–3x | 中 | 中——多文件但可并行验证 | 结构化可分解的大型任务 |
+| Manager-Worker | 3–5x | 中 | 中高——分工错误代价明显 | 大型多文件任务，有明确分工 |
+| Generator-Critic | ~2x | 高 | 中——主观质量维度（可读性/正确性） | 代码生成、文档写作 |
+| 多 Agent 辩论 | 4–6x | 最高 | 高——多视角冲突会致命 | 安全审计、设计评审、关键决策 |
+| Evaluator（附加） | +1.5–2x 附加于 Generator | 高（补漏） | 高——自评会系统性漏判 | 主观维度无法代码化、需独立评审 |
+| 对抗式验证（附加） | +2–3x 附加于 Evaluator/Generator | 最高（证伪） | 最高——假阴性代价 > 假阳性 | 安全审计、关键决策、上线/回滚 |
+
+\* Token 倍率为**基于经验的估算**（相对 solo 基线），非实测基准；具体数值随模型、子任务粒度、few-shot 长度浮动。Evaluator 与对抗式验证是**附加倍率**——它们叠在某个生成拓扑之上，而非独立运行。
+
+### 拓扑经济性对照表（选型速查）
+
+```
+缺陷成本 ↑
+  │  对抗式验证 / 辩论      ← 假阴性代价极高，值得多跑 2-3 个 Agent
+  │  Evaluator
+  │  Generator-Critic
+  │  Manager-Worker / Coordinator
+  │  solo
+  └──────────────────────→ Token 倍率 ↑（经济成本）
+
+黄金法则：选「刚好覆盖缺陷成本」的最轻拓扑。
+  - 缺陷便宜 → solo 或 Coordinator 足够
+  - 缺陷中等 → Generator-Critic / Manager-Worker
+  - 缺陷昂贵且主观 → Evaluator / 辩论 / 对抗式
+```
 
 ## 规模适配
 
-- **Minimal**：不支持多 Agent 拓扑。
-- **Professional**：可选。通过 Coordinator 模式实现基础的 Manager-Worker。
-- **Enterprise**：完整支持三种拓扑。包含 Agent 池管理、拓扑选择器、动态 Worker 扩缩。
+- **Minimal**：不支持多 Agent 拓扑。单 Agent 自检（不强制 Evaluator，缺陷成本由人工兜底）。
+- **Professional**：可选。通过 Coordinator 模式实现基础的 Manager-Worker；Generator-Critic 的 Critic 可作为轻量独立评审；Evaluator 仅用于关键产物。
+- **Enterprise**：完整支持四种拓扑（Manager-Worker / Generator-Critic / Debate / Evaluator）。包含 Agent 池管理、拓扑选择器、动态 Worker 扩缩；Evaluator 与对抗式验证作为默认推断型门禁叠加在计算型验证之后。
+
+### Evaluator / 对抗式验证 的三级规模差异
+
+| 维度 | Minimal | Professional | Enterprise |
+|------|:-------:|:-----------:|:----------:|
+| Evaluator 是否启用 | 否（单 Agent 自检） | 可选，仅关键产物 | **默认启用**，叠加于计算型门禁后 |
+| rubric 形式 | — | 内嵌简版（2–3 维度） | 完整 rubric（维度 + 阈值 + few-shot 校准） |
+| 对抗式验证 | 否 | 否 | 安全审计 / 关键决策自动触发 |
+| 输出回喂 | — | `score + evidence` 文本日志 | `score + evidence + counter_proposal` 结构化注入 + 聚合可观测 |
+| 不自评约束 | 不强制 | 建议独立 reviewer | **强制**：Generator ≠ Evaluator，禁止 self-evaluate |
 
 ## AI 构建提示
 
@@ -419,15 +587,18 @@ class DebateLoop:
 根据用户选择的规模实现多 Agent 拓扑：
 
 Enterprise 级别：
-  1. 实现 ManagerWorkerLoop 类，支持子任务拆解和动态重分配
-  2. 实现 GeneratorCriticLoop 类，Generator 使用高温度（0.7-0.9），Critic 使用低温度（0.0-0.1）
+  1. 实现 ManagerWorkerLoop 类，支持子任务拆解和动态重分配（重分配最多 3 次，按子任务独立计数，失败标准见拓扑 1）
+  2. 实现 GeneratorCriticLoop 类，Generator 使用高温度（0.7-0.9）；**Critic 使用低温度（0.0-0.1）且独立上下文**——Critic 从空白 messages 启动，不继承 Generator 历史，输出 {score, feedback, evidence}（与 Evaluator 统一口径）
   3. 实现 DebateLoop 类，支持可配置的 Expert 数量和辩论轮次
-  4. 实现拓扑选择器：根据任务类型自动选择合适拓扑
-  5. 每个子 Agent 拥有独立上下文窗口（从空白消息列表开始）
+  4. 实现 EvaluatorAgent 类（拓扑 4），严格遵守四条构造约束：①独立上下文（构造函数不接受 messages）②显式 rubric（维度+阈值）③few-shot 校准样本 ④输出 {score, evidence, counter_proposal}
+  5. 实现拓扑选择器：根据任务类型与缺陷成本自动选择合适拓扑（参考拓扑经济性对照表）
+  6. 每个子 Agent 拥有独立上下文窗口（从空白消息列表开始）
 
 关键约束：
   □ 子 Agent 不接受完整消息历史，只接受结构化子任务描述
   □ 子 Agent 返回结构化摘要（{findings, files_modified, errors, suggestions}）
   □ 一个子 Agent 失败不应阻塞其他子 Agent
   □ 子 Agent 间通过 Coordinator 通信，不直接交互
+  □ Generator ≠ Critic ≠ Evaluator：三者必须是独立实例，禁止任何 self-verify / self-evaluate
+  □ 计算型验证（compile/lint/test，见 references/04-phase-agent-loop.md）优先于 Evaluator；Evaluator 只补漏无法代码化的主观维度
 ```

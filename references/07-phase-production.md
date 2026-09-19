@@ -133,6 +133,95 @@ Claude Code 本身使用 OpenTelemetry + gRPC 进行遥测，Harness 应遵循�
 
 ---
 
+## 确定性门禁清单（Guides & Sensors）
+
+**何时读本节**：当你要确定"Agent 每写完一块代码，靠什么客观信号判断它没搞砸"时使用本节。这是 Phase 4 `references/04-phase-agent-loop.md` 中 `Verifier` 与 `CONTINUE-SITE-8` 在生产侧的落地清单——把"验证"从一句模糊的"跑测试"变成一条可机器解析的**确定性门禁链**。
+
+### 核心论断：用确定性验证包裹概率性智能
+
+2026 harness 工程的第一性原则：**Agent 的"智能"是概率性的，但判断它是否做对的反馈必须是确定性的**。TypeScript 编译器报 TS2345，不需要再找一个 LLM 来判断"编译是否成功"，编译器自己知道。lint、类型检查、测试、结构分析都是围绕 Agent 的**快速确定性反馈机制**——它们就是 Martin Fowler 所说的 **sensors**（行动后才生效的反馈），与行动前的 **guides**（AGENTS.md、架构文档、代码规范）共同构成最强 harness。
+
+### 门禁链顺序
+
+```
+代码产出（Generator）
+     │
+     ▼
+┌──────────────────────────────────────────────────────────┐
+│  确定性门禁链（每个门失败即产生结构化 sensor，回喂 LLM）      │
+│                                                          │
+│  1. compile   编译通过？                                   │
+│       │ 失败 → {file, line, error_code}                   │
+│       ▼ 通过                                               │
+│  2. lint     静态检查通过？（ruff / eslint / golangci）     │
+│       │ 失败 → {file, line, col, code, severity}           │
+│       ▼ 通过                                               │
+│  3. type     类型检查通过？（tsc / mypy / pyright）         │
+│       │ 失败 → {file, line, error_code}                    │
+│       ▼ 通过                                               │
+│  4. unit     单元测试通过？                                 │
+│       │ 失败 → {test_id, file, assertion}                  │
+│       ▼ 通过                                               │
+│  5. integration  集成测试通过？                             │
+│       │ 失败 → {scenario, error}                           │
+│       ▼ 通过                                               │
+│  6. architecture  架构检查？（依赖环 / 分层违例 / 接口契约）  │
+│       │ 失败 → {violation, module}                         │
+│       ▼ 通过                                               │
+│  7. security  安全扫描？（secret / SAST / 依赖漏洞）         │
+│       │ 失败 → {rule, severity, location}                  │
+│       ▼ 通过                                               │
+│  产出可交付                                                  │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 输出必须机器可解析
+
+门禁能回喂给 LLM 的**前提**是：它的输出是结构化的，而不是一段人类可读但机器难解析的日志。每个门必须产出如下字段骨架（可序列化为 JSON / dict），供 `CONTINUE-SITE-8` 原样注入下一轮上下文：
+
+```json
+{
+  "gate": "lint",
+  "passed": false,
+  "tool": "ruff",
+  "exit_code": 1,
+  "findings": [
+    {
+      "file": "src/main.py",
+      "line": 23,
+      "col": 5,
+      "code": "F401",
+      "severity": "error",
+      "message": "module imported but unused"
+    }
+  ]
+}
+```
+
+> 字段约定：每个门至少有 `gate`（门名称）、`passed`（布尔）、`tool`（实际执行器）、`exit_code`、`findings[]`；每条 finding 至少含 `file` + `line` + `code`（错误码）。越结构化，LLM 下一轮定位越快——**不要**只返回"lint 失败了"这种自然语言。
+
+### 与 CI 流水线的分工
+
+| 维度 | Agent 内循环（确定性门禁） | CI 流水线 |
+|------|---------------------------|-----------|
+| 触发时机 | **每轮行动后**（Generator 写完即验） | 部署前 / PR 合并前 |
+| 目的 | 给 LLM 即时 sensor，驱动自我修正 | 给团队/系统一个不可绕过的发布门 |
+| 失败后果 | 结构化输出回喂，Agent 重试或 replan | 阻断合并 / 阻断发布 |
+| 粒度 | 单文件 / 单函数级别快速反馈 | 全量构建 + 全量测试 |
+| 谁消费输出 | LLM 下一轮（见 04 的 CONTINUE-SITE-8） | 人类 reviewer / 发布系统 |
+
+两者互补：**CI 是部署前的硬性门禁，Agent 内循环是开发过程中的软性 sensor**。理想情况下 Agent 内循环已经把 90% 的确定性错误在上游消灭，CI 只需兜底人类介入前的最后一道关。
+
+### 三级规模差异
+
+| 维度 | Minimal | Professional | Enterprise |
+|------|:-------:|:-----------:|:----------:|
+| 门禁覆盖 | compile + unit 占位 | compile → lint → type → unit | 全链路 7 门（含 integration / architecture / security） |
+| 输出格式 | 文本日志 | 结构化 findings 注入上下文 | 结构化 + 聚合到可观测系统，并对接 CI |
+| 与 CI 关系 | 无 | 本地门禁 ≈ CI 子集 | 内循环门禁与 CI 共享同一套门定义（单一事实来源） |
+
+---
+
 ## 抽象接口层
 
 以下是各子系统的接口抽象，不提供具体实现代码，只描述接口契约和设计意图。
@@ -370,6 +459,8 @@ Harness 的架构天然支持 crash recovery——不需要保存 Agent 进程�
 - [ ] SessionEvent 有持久化策略（文件/S3/数据库至少一种）
 - [ ] 优雅关闭：SIGTERM 不丢失进行中的 Session 状态
 - [ ] Grafana Dashboard 包含：Token 消耗趋势图、延迟热力图、工具成功率面板
+- [ ] 确定性门禁（compile→lint→type→unit→integration→架构检查→安全扫描）每轮行动后执行
+- [ ] 验证输出**是否结构化、是否可回喂 LLM** 被显式校验（门禁失败须产出 file + line + error_code 而非自然语言）
 
 ---
 

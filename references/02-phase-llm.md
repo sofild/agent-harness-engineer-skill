@@ -177,6 +177,58 @@ class ModelCapability:
 
 ---
 
+## 模型路由抽象：ModelRouter
+
+> 成本控制的核心杠杆（效果与降级链详见 `references/06-phase-permissions.md` 的「预算与成本控制」）。按步骤类型把请求路由到 cheap / strong 模型，且路由决策**必须可审计**——记录选了哪个模型、为什么。
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict
+
+
+class StepType(Enum):
+    """Agent 单步的语义类型，路由决策的依据。"""
+    ROUTING = "routing"                  # 意图 / 分支路由
+    TOOL_SELECTION = "tool_selection"    # 选哪个工具
+    CLASSIFICATION = "classification"    # 分类 / 标签
+    SIMPLE_STEP = "simple_step"          # 简单生成 / 抽取
+    HARD_REASONING = "hard_reasoning"    # 真正难的推理（留给 strong）
+
+
+@dataclass
+class RouteDecision:
+    """一次路由决策的可审计记录。"""
+    selected_model: str                  # 实际选中的模型名（cheap 或 strong 档）
+    tier: str                            # "cheap" | "strong"
+    reason: str                          # 为何选它（步骤类型 + 置信度）
+    step_type: StepType
+    # ⚠ AI构建提示: 每次决策都必须落审计日志，字段为不可变记录，
+    # ⚠ AI构建提示: 事后可调优路由阈值、复盘成本归因。
+
+
+class ModelRouter(ABC):
+    """按步骤类型把请求路由到合适档位的模型，并产出可审计决策。"""
+
+    @abstractmethod
+    def route(self, step_type: StepType, context: Dict) -> RouteDecision:
+        """根据步骤类型与上下文返回应选模型；必须填写 reason 以便审计。"""
+        raise NotImplementedError("AI: 维护 cheap/strong 两档模型池；"
+                                  "ROUTING/TOOL_SELECTION/CLASSIFICATION/SIMPLE_STEP 默认走 cheap，"
+                                  "仅 HARD_REASONING 走 strong；返回 RouteDecision 并记录 reason")
+
+    @abstractmethod
+    def record_decision(self, decision: RouteDecision, task_id: str) -> None:
+        """把路由决策写入审计流（与 06 的审计日志 Layer 5 打通）。"""
+        raise NotImplementedError("AI: 将 RouteDecision 推送到审计日志，"
+                                  "含 selected_model/tier/reason/step_type，供成本归因")
+```
+
+路由原则：前沿模型只留给 `HARD_REASONING`；其余步骤走 cheap 模型。RouteLLM 一类方案报告在保持约 95% 质量的同时降本约 85%。路由决策不可黑盒——`reason` 字段是审计与成本归因的命脉。
+
+---
+
 ## AI构建提示
 
 ```

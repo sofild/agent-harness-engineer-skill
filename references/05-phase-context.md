@@ -19,14 +19,25 @@
 
 ## 渐进式压缩的经济学
 
-四级压缩的本质是成本阶梯：每一级仅在前一级不足时触发，避免"用大炮打蚊子"。
+四级压缩的本质是成本阶梯：每一级仅在前一级不足时触发，避免"用大炮打蚊子"。**管道顺序经过实测重排——Mask 必须最先做**：它确定、免费、可逆，且工具输出正是 Agent 上下文增长的主要来源（一条 `read_file` / `bash` 结果可能轻松占用数万 token）。
 
-| 级别 | 成本 | 场景 |
-|------|------|------|
-| Snip | ~0ms, 0 API调用 | 90%的日常情况 |
-| Microcompact | ~1ms, 0 API调用 | 工具输出过长 |
-| Context-Collapse | ~5ms, 0 API调用 | 历史对话冗余 |
-| Autocompact | ~2s, 1次API调用 | 前三者均不足 |
+| 级别 | 名称 | 成本 | 场景 |
+|------|------|------|------|
+| Level 1 | Mask（工具结果遮蔽/清除） | ~0ms, 0 API调用 | 工具输出过长——**首选，几乎每次都先做** |
+| Level 2 | Snip（剪断最旧历史） | ~0ms, 0 API调用 | 历史累计过长 |
+| Level 3 | Collapse（上下文折叠） | ~5ms, 0 API调用 | 历史对话冗余 |
+| Level 4 | Autocompact（自动摘要） | ~2s, 1次API调用 | 前三者均不足 |
+
+### 成本 / 收益 / 有损性对照表
+
+| 级别 | 直接成本 | 收益 | 有损性 | 可逆性 |
+|------|----------|------|--------|--------|
+| Mask | 0（纯字符串） | 清除工具输出中段，释放最多 token；JetBrains 实测约 **52% 成本下降 + ~2.6% 解决率提升** | 低——保留头尾与 structured 结果，遮蔽中段日志 | 完全可逆（原消息保留，仅生成遮蔽视图） |
+| Snip | 0 | 移除最旧历史，确定性高 | 中——注入摘要，丢失原文细节 | 半可逆（需重读原文件恢复） |
+| Collapse | 0 | 折叠连续非关键消息为一条模板摘要 | 中——模板摘要丢细节 | 完全可逆（读时投射，原数组不改） |
+| Autocompact | 1 次 LLM 调用（单次可消耗 ~180K input token） | 语义压缩整段历史 | 高——LLM 摘要必然丢信息，检索类任务尤敏感 | 不可逆（原文被替换） |
+
+> **关键取舍：遮蔽优先于摘要。** JetBrains《The Complexity Trap》(arXiv 2508.21433) 对照数据：观察遮蔽带来约 52% 成本下降 + 约 2.6% 解决率提升；纯摘要省下同样的钱，却让轨迹最多变长 15%。**默认先遮蔽，靠实力才用摘要。**
 
 ---
 
@@ -37,14 +48,16 @@
 ```
 AgentCore
   └─ CompressionPipeline   ← 编排四级压缩，暴露 compact() 入口
-       ├─ SnipStrategy
-       ├─ MicrocompactStrategy
-       ├─ CollapseStrategy
-       └─ AutocompactStrategy
-  └─ MemoryManager         ← 四分类记忆生命周期管理
+       ├─ MaskStrategy        ← Level 1：工具结果遮蔽/清除（首选）
+       ├─ SnipStrategy        ← Level 2：剪断最旧历史
+       ├─ CollapseStrategy    ← Level 3：上下文折叠（读时投射）
+       └─ AutocompactStrategy ← Level 4：LLM 语义摘要
+  └─ MemoryManager         ← 四分类记忆 + 外部 scratchpad 生命周期管理
        ├─ ShortTermStore    ← 内存中，本次会话
-       └─ LongTermStore     ← 文件/向量DB，跨会话
+       ├─ LongTermStore     ← 文件/向量DB，跨会话
+       └─ ScratchpadStore   ← 轻量文件，压缩无损安全网
   └─ SessionWAL            ← JSONL追加日志，可恢复
+  └─ CompactionLedger      ← 每次压缩的归因台账（append-only）
 ```
 
 **CompressionPipeline** 不直接修改 `messages` 数组。它接收 `CompressionRequest {messages[], tokenBudget, reason}`，返回 `CompressionResult {compressedMessages[], tokensFreed, levelUsed, recoveryHints[]}`。这保证"压缩"与"消息管理"解耦。
@@ -61,29 +74,109 @@ AgentCore
 
 所有压缩策略统一从 `tokenCounter` 模块获取精确token数（通过模型原生tokenizer，不依赖 `len(content)/4` 估算）。`tokenCounter.count(text)` 返回精确值，`tokenCounter.estimate(structuredMessage)` 返回含元数据的估算。
 
-压缩触发条件：`currentTokens > budget * 0.85`，且 `hasAttemptedReactiveCompact == false`（见陷阱章节）。
+压缩触发条件：`currentTokens > budget * 0.60 ~ 0.70`（默认 0.65），且 `hasAttemptedReactiveCompact == false`（见陷阱章节）。
+
+**为什么是 60-70% 而非 85%**：context rot 研究显示 200K 窗口的模型在约 50K token 处就开始可测量退化。在 85% 才触发意味着摘要器（Autocompact，本身就是一次 LLM 调用）自己已在退化区间里工作——摘要质量在最需要的时候最差。60-70% 留出足够 headroom，使 Autocompact 在模型尚可正常推理时完成。
+
+**阈值取舍**：
+- **下调（更激进，如 50%）**：更早压缩、摘要质量更高、单次压缩更便宜；代价是压缩更频繁、更多 LLM 调用、活跃上下文被压缩得更小。Anthropic Compaction API 最低可配 50,000 token 触发即此思路。
+- **上调（更保守，如 85%）**：减少压缩次数、活跃上下文更大；代价是压缩在高退化区触发，摘要质量崩塌，且 85% 处留给压缩本身的空间极小（单次压缩可消耗 ~180K input token），易触发 `context_length_exceeded`。**85% 不对**——它把最贵的步骤放在模型最弱的时候。
+- **默认 60-70% 是可辩护区间**：服务端默认更保守。Anthropic Compaction API 默认在累计输入 150,000 token 触发（可配最低 50,000）；Claude Code 在 200K 窗口约 95% 触发属客户端实现，不代表服务端最佳实践。
 
 ---
 
-## Level 1: Snip（剪断）
+## Level 1: Mask（工具结果遮蔽 / 清除）
+
+**何时读本节**：当你发现上下文被 `read_file` / `bash` 等工具输出撑爆，但对话历史并不长时——这是管道**首选**。
+
+**目标**：对超长工具结果进行遮蔽或清除，只保留决策所需的结构化片段。它是管道第一个入口：确定、免费、可逆，且工具输出正是最主要的上下文增长源。
+
+**是否触发**：消息数组中存在 `role == "tool"` 且 `tokenCount(content) > outputProfile.threshold` 的消息。满足即触发，无需等待预算阈值。
+
+**复杂度**：O(M) 遍历消息。
+**成本**：~0ms，纯字符串操作，0 网络 IO。
+
+### 抽象接口
+
+```
+class MaskStrategy:
+    """Level 1 压缩：工具结果遮蔽/清除。优先于一切其他压缩。"""
+    def compress(self, request: CompressionRequest) -> Optional[CompressionResult]:
+        raise NotImplementedError(
+            "AI: 遍历 role==tool 的消息，按 meta.outputProfile 阈值（如 read_file=8000, bash=2000）"
+            "对超长结果做头尾保留 / 字段提取 / 整体清除；"
+            "标记 masked=True 防重复遮蔽；原消息保留仅生成遮蔽视图；"
+            "返回 CompressionResult 或 None（无超长工具结果时）"
+        )
+```
+
+### 算法（伪代码）
+
+```
+FUNCTION mask(messages, outputProfiles):
+    freed ← 0
+    FOR EACH msg IN messages WHERE msg.role == "tool":
+        threshold ← outputProfiles[msg.tool].threshold
+        contentTokens ← tokenCount(msg.content)
+        IF contentTokens ≤ threshold:
+            CONTINUE  ← 短结果无需处理
+
+        ── 三种遮蔽模式，按工具类型选择 ──
+        IF 工具为 "structured_output"（如 JSON 结果）:
+            msg.view ← 仅保留 status / files_changed / error 等决策字段
+        ELSE:
+            headContent ← 取前 headTokens 个token
+            tailContent ← 取后 tailTokens 个token
+            midTruncated ← contentTokens - headTokens - tailTokens
+            msg.view ← headContent + "... [中间 {midTruncated} tokens 已遮蔽] ..." + tailContent
+        msg.meta.masked ← true
+        freed ← freed + midTruncated
+    RETURN (messages, freed)
+```
+
+**关键设计决策**：
+
+- **遮蔽优先于摘要**：对照表与 JetBrains 数据（约 52% 成本下降 + ~2.6% 解决率提升）。先遮蔽，靠实力才用摘要。
+- **头尾保留或字段提取**：开头含状态/概要，末尾含结论/错误，中段日志价值低；结构化结果直接提取决策字段。
+- **阈值差异化**：由工具注册时的 `meta.outputProfile` 提供（`read_file`≈8000、`bash`≈2000）。
+- **完全可逆**：原消息保留，仅生成遮蔽视图注入；`masked: true` 防重复遮蔽。
+
+---
+
+## Level 2: Snip（剪断最旧历史）
+
+**何时读本节**：当 Mask 之后历史累计 token 仍逼近预算，且最旧片段对当前决策价值低时。
 
 **目标**：移除消息历史中最旧的连续片段。
-**复杂度**：O(1) 数组操作。
-**成本**：~0ms，无网络IO。
+**是否触发**：Mask 执行后 `currentTokens` 仍 > `budget * 0.60~0.70`，且最旧连续 N 条非决策关键消息 token 总和 ≥ 目标释放量。
 
-### 算法
+**复杂度**：O(1) 数组操作。
+**成本**：~0ms，无网络 IO。
+
+### 抽象接口
+
+```
+class SnipStrategy:
+    """Level 2 压缩：剪断最旧历史。Mask 不足时才用。"""
+    def compress(self, request: CompressionRequest) -> Optional[CompressionResult]:
+        raise NotImplementedError(
+            "AI: 取 messages 前 N 条使 token 总和 ≥ targetTokensToFree；"
+            "注入 system 消息声明已剪断并附简短摘要；"
+            "边界：N<5 或总数<10 时不剪断；返回 CompressionResult 或 None"
+        )
+```
+
+### 算法（伪代码）
 
 ```
 FUNCTION snip(messages, targetTokensToFree):
-    oldestBlock ← 取 messages 前 N 条消息，
-                   使得这 N 条消息的 token 总和 ≥ targetTokensToFree
+    oldestBlock ← 取 messages 前 N 条，使其 token 总和 ≥ targetTokensToFree
     remainder   ← messages[N:]
 
-    ── 构建系统注入消息 ──
     injection ← {
         role: "system",
         content: "上下文已剪断。以下为已跳过的历史摘要：" +
-                 生成 N 条消息的简要摘要（每条消息截取前80字符）
+                 生成 N 条消息的简要摘要（每条截取前80字符）
     }
 
     resultMessages ← [injection] + remainder
@@ -95,51 +188,17 @@ FUNCTION snip(messages, targetTokensToFree):
     如果 messages 总数 < 10: 不进行Snip，返回原始消息
 ```
 
-**关键设计决策**：Snip 不静默删除——它注入一条 system 消息说明"已剪断"，让LLM感知到上下文的断裂点。否则Agent会困惑"之前聊的内容去哪了"。
-
-**触发顺序**：Snip 是压缩管道的第一个入口。每次检查token预算时优先尝试。
+**关键设计决策**：Snip 不静默删除——它注入一条 system 消息说明"已剪断"，让 LLM 感知上下文断裂点，否则 Agent 会困惑"之前的内容去哪了"。Snip 在 Mask 之后、作为管道第二入口。
 
 ---
 
-## Level 2: Microcompact（微压缩）
+## Level 3: Collapse（上下文折叠）
 
-**目标**：对超过阈值的工具调用结果进行头尾截断，保留关键信息。
-**复杂度**：O(M) 遍历消息，M为消息总数。
-**成本**：~1ms，纯字符串操作。
+**何时读本节**：当历史中存在连续大量"非决策关键"消息（确认、闲聊、无 tool_call 的回复），需要无损回退地压扁时。
 
-### 算法
+**目标**：通过"读时投射"将 N 条连续历史消息折叠为一条模板摘要消息，但不修改原始消息数组——仅在读取上下文时动态注入。
+**是否触发**：消息数组包含连续 ≥20 条"非决策关键"消息（决策关键=tool_calls / plan 变更 / task status 变更；非关键=纯文本对话、确认、无 tool_call 的 assistant 回复）。
 
-```
-FUNCTION microcompact(messages, resultThreshold=4000, headTokens=1500, tailTokens=500):
-    freed ← 0
-    FOR EACH msg IN messages WHERE msg.role == "tool":
-        contentTokens ← tokenCount(msg.content)
-        IF contentTokens ≤ resultThreshold:
-            CONTINUE  ← 跳过短结果
-
-        headContent ← 取前 headTokens 个token对应的文本
-        tailContent ← 取后 tailTokens 个token对应的文本
-        midTruncated ← contentTokens - headTokens - tailTokens
-
-        separator ← "... [中间 {midTruncated} tokens 已截断] ..."
-
-        msg.content ← headContent + separator + tailContent
-        freed ← freed + midTruncated
-
-    RETURN (messages, freed)
-```
-
-**关键设计决策**：
-
-- **头尾保留**：工具输出的开头通常包含状态/概要，末尾通常包含结论/错误——两者都是决策关键信息。中段（例如大段日志或中间步骤）对后续推理价值低。
-- **阈值差异化**：不同工具类型应有不同阈值。例如 `read_file` 输出阈值可设为 8000，`bash` 输出阈值可设为 2000。阈值由工具注册时的 `meta.outputProfile` 字段提供。
-- **不可逆标注**：截断后的消息在元数据中标记 `microcompacted: true`，防止被重复截断。
-
----
-
-## Level 3: Context-Collapse（上下文折叠）
-
-**目标**：通过"读时投射"将N条连续历史消息折叠为一条摘要消息，但不修改原始消息数组——仅在读取上下文时动态注入折叠摘要。
 **复杂度**：O(N) 遍历折叠窗口。
 **成本**：~5ms，字符串模板拼接。
 
@@ -180,95 +239,178 @@ FUNCTION applyCollapseProjection(messages, collapseStore):
 FUNCTION generateCollapseSummary(messagesInSpan):
     ── 构建模板化摘要，不调用LLM ──
     summary ← ""
-
     FOR EACH msg IN messagesInSpan:
         IF msg.role == "user":
             summary ← summary + "用户: " + truncate(msg.content, 200) + "\n"
         ELSE IF msg.role == "assistant" AND msg有tool_calls:
-            summary ← summary + "调用了工具: "
-            FOR EACH tc IN msg.tool_calls:
-                summary ← summary + tc.name + " "
-            summary ← summary + "\n"
+            summary ← summary + "调用了工具: " + join(tc.name for tc in msg.tool_calls) + "\n"
         ELSE IF msg.role == "tool":
             summary ← summary + "工具结果(" + tokenCount(msg.content) + " tokens)\n"
         ELSE:
             summary ← summary + "消息(" + tokenCount(msg.content) + " tokens)\n"
-
     RETURN summary
 ```
 
 **关键设计决策**：
 
-- **不修改原数组**：与 Snip/Microcompact 不同，Collapse 不改变 `messages` 数组本身。它只在 `buildAPIRequest()` 阶段通过投射生成轻量版本。这意味着 Collapse 是可回退的——如果后续需要完整历史进行调试，原始消息仍然完整。
-- **Collapse触发时机**：当消息数组包含连续20+条"非决策关键"的消息时。决策关键消息包括：tool_calls、plan变更、task status变更。非关键消息包括：纯文本对话、确认消息、无工具调用的assistant回复。
+- **不修改原数组**：Collapse 不改变 `messages` 数组，只在 `buildAPIRequest()` 阶段通过投射生成轻量版本。可回退——需完整历史调试时原文仍在。
 - **去重检查**：折叠前检查 bloom filter，避免已折叠区间被重复折叠。
 
 ---
 
-## Level 4: Autocompact（自动压缩）
+## Level 4: Autocompact（自动摘要）
 
-**目标**：调用LLM对整段对话历史进行语义摘要，是唯一涉及API调用的压缩级别。仅在前三级均不足以释放足够token空间时触发。
-**成本**：1次完整的LLM API调用（~2s延迟）。
+**何时读本节**：当 Mask→Snip→Collapse 三级均不足以释放空间，且上下文已逼近 60-70% 触发线时——这是唯一涉及 API 调用的级别，最贵、最有损。
 
-### 算法
+**目标**：调用 LLM 对整段对话历史进行语义摘要。仅在前三级均不足时触发。
+**是否触发**：Mask/Snip/Collapse 全部执行后 `currentTokens` 仍 > `budget * 0.60~0.70`，且 `hasAttemptedReactiveCompact == false`。
+
+**成本**：1 次完整 LLM 调用（单次可消耗 ~180K input token，本身计费）。
+
+### 抽象接口
+
+```
+class AutocompactStrategy:
+    """Level 4 压缩：LLM 语义摘要。最贵、最有损，最后才用。"""
+    def compress(self, request: CompressionRequest) -> Optional[CompressionResult]:
+        raise NotImplementedError(
+            "AI: 从尾向头扫描定位最小压缩区间，保留最近消息；"
+            "用 SCHEMA 模板（见下文）调用 LLM 生成摘要；"
+            "注入带恢复指令的 system 消息；写入 CompactionLedger；"
+            "断言 head 逐字节不变；返回 CompressionResult 或 None"
+        )
+```
+
+### 算法（伪代码）
 
 ```
 FUNCTION autocompact(messages, targetFreeTokens, llmClient):
-    ── 第一步：定位压缩区间 ──
+    ── 第一步：从尾向头扫描定位最小压缩区间 ──
     compressionStart ← 0
     accumulatedTokens ← 0
-    FOR i FROM len(messages)-1 DOWN TO 0:   ← 从尾部向头部扫描
+    FOR i FROM len(messages)-1 DOWN TO 0:
         accumulatedTokens ← accumulatedTokens + tokenCount(messages[i])
         IF accumulatedTokens ≥ targetFreeTokens:
             compressionStart ← i
             BREAK
-
     IF compressionStart == 0:
         RETURN FAILURE("无法压缩足够空间")
 
     historicalMsgs ← messages[0:compressionStart]
     recentMsgs    ← messages[compressionStart:]
-    ── 保留最后10条消息不压缩（最近的上下文最重要）──
-    IF len(recentMsgs) < 10:
+    IF len(recentMsgs) < 10:   ← 保留最近10条不压缩
         compressionStart ← max(0, len(messages) - 10)
         historicalMsgs ← messages[0:compressionStart]
-        recentMsgs ← messages[compressionStart:]
+        recentMsgs    ← messages[compressionStart:]
 
-    ── 第二步：调用LLM生成摘要 ──
-    compactPrompt ← """
-    请对以下对话历史进行结构化摘要，保留以下关键信息：
-    1. 用户的核心目标（当前任务是什么）
-    2. 已完成的步骤（按顺序列出）
-    3. 关键决策点（触发了哪些工具，为什么要触发）
-    4. 未解决的问题/待处理的任务
-    5. 当前工作的文件清单
-    6. 正在使用的Skill/工具上下文
+    ── 第二步：用 schema 化模板调用 LLM 生成摘要（见下）──
+    summary ← llmClient.invoke(SCHEMA_PROMPT + 序列化(historicalMsgs))
 
-    格式：简洁，使用要点列表。不要包含无关的闲聊内容。
-    """
-    summary ← llmClient.invoke(compactPrompt + 序列化(historicalMsgs))
-
-    ── 第三步：构建恢复提示 ──
+    ── 第三步：构建恢复提示（注入到 head 之后，不得改写 head）──
     recoveryMessage ← {
         role: "system",
-        content: "── 上下文压缩点（Autocompact）──\n" +
-                 "以下历史已被压缩为摘要，但关键状态已保留：\n\n" +
-                 summary + "\n\n" +
-                 "── 恢复指令 ──\n" +
-                 "1. 继续执行未完成的任务\n" +
-                 "2. 必要时重新读取当前工作文件\n" +
-                 "3. 正在使用的工具上下文已在前置消息中恢复"
+        content: "── 上下文压缩点（Autocompact）──\n" + summary +
+                 "\n── 恢复指令 ──\n1. 继续执行未完成任务\n2. 必要时重读当前工作文件\n3. 工具上下文已在前置消息恢复"
     }
-
     resultMessages ← [recoveryMessage] + recentMsgs
     RETURN (resultMessages, tokenCount(historicalMsgs) - tokenCount(summary))
 ```
 
 **关键设计决策**：
 
-- **从尾到头扫描**：Autocompact 从消息历史尾部向头部累加 token，确定最小压缩区间。这保证压缩的是"最旧且最不重要"的部分。
-- **结构化摘要Prompt**：摘要不是自由文本，而是包含6个固定字段的结构化模板。这确保LLM压缩后的信息密度可预期，后续Agent能可靠地从摘要中恢复状态。
-- **恢复消息**：压缩后不是简单替换，而是插入一条带恢复指令的system消息——明确告诉LLM"你需要从头恢复状态"。
+- **从尾到头扫描**：保证压缩"最旧且最不重要"的部分。
+- **schema 化摘要**：见下方"Autocompact 摘要模板"，强制包含"已排除的方案及原因"，防止 Agent 重试死路。
+- **恢复消息**：插入带恢复指令的 system 消息，明确告知"需从头恢复状态"；该消息必须追加在 head 之后（见硬约束章节）。
+
+---
+
+## Autocompact 摘要模板（schema 化）
+
+**何时读本节**：当你实现 Level 4 的摘要 prompt 时——自由要点会丢掉"为什么放弃方案 A"，而那恰恰是防止 Agent 重试死路的关键信息。
+
+摘要必须为**结构化 schema**，而非 6 字段自由要点。强制字段如下：
+
+```
+CompactSummary {
+    goal:                 str   # 用户核心目标（当前任务是什么）
+    decisions:            list  # 决策及其理由（按时间序）
+    excluded_approaches:  list  # 【必填】已排除的方案及原因——防止重试死路
+    plan_status:          str   # 当前计划状态（进行中/受阻/已完成步骤）
+    constraints_found:    list  # 发现的约束（环境/接口/权限限制）
+    artifacts:            list  # 产出的产物（已改文件、已建对象、引用路径）
+    open_tasks:           list  # 未解决/待处理任务
+}
+```
+
+摘要 prompt 约束：
+- `excluded_approaches` 必须逐条给出**方案 + 放弃原因**（如"方案A：直接改全局配置——放弃，因其会破坏多租户隔离"）。
+- 文件路径、凭据引用写入 `artifacts` 并同步落外部 scratchpad（见记忆系统），不依赖摘要存活。
+- 摘要全文写入 `CompactionLedger.summary_text`，供事后归因。
+
+---
+
+## CompactionLedger（压缩台账）
+
+**何时读本节**：当压缩后 Agent 行为异常、你想归因"它到底丢了什么"时——没有台账，压缩后一犯迷糊无法回溯。
+
+每次压缩（任一级）写入一条 append-only 台账记录。压缩本身是计费的采样步骤（先读完整上下文，单次 ~180K input token），必须可事后复盘。
+
+### 字段骨架
+
+```
+class CompactionLedger:
+    def record(self, entry: LedgerEntry) -> None:
+        raise NotImplementedError(
+            "AI: 以 append-only JSONL 写入台账；每次压缩一条；"
+            "字段见 LedgerEntry；与 SessionWAL 的 COMPRESSION 事件对齐"
+        )
+
+@dataclass
+class LedgerEntry:
+    seq_id:            str
+    level:             int     # 1=Mask 2=Snip 3=Collapse 4=Autocompact
+    triggered_at_tokens: int   # 压缩前占用
+    freed_tokens:      int     # 释放量
+    after_tokens:      int     # 压缩后占用
+    cleared:           list[str]  # 被清除/遮蔽的具体内容引用（如 "tool:read_file @msg#42 中段 8000tok"）
+    summarized:        list[str]  # 被摘要的跨度（如 "msg#10-#30 折叠为 1 条"）
+    summary_text:      str     # Autocompact 摘要全文（Mask/Snip 可为空）
+    head_unchanged:    bool    # 断言 head 是否逐字节不变
+    timestamp:         str
+```
+
+> 台账与 SessionWAL 的 `COMPRESSION` 事件互补：WAL 记"发生了压缩"，台账记"清除了什么、摘要了什么、原文全文"。
+
+---
+
+## 服务端压缩 / Context Editing 对接
+
+**何时读本节**：当你在自建管道与服务端能力之间做架构选择时。
+
+| 方案 | 何时用 | 谁买单 | 备注 |
+|------|--------|--------|------|
+| 服务端压缩（如 Anthropic Compaction API） | 不想维护客户端记账、上下文可达服务端默认阈值 | 服务端 | 默认累计输入 150,000 token 触发，可配最低 50,000 |
+| 自建管道（Mask→Snip→Collapse→Autocompact） | 需要精细控制、低成本优先、自定义台账 | 客户端 | 本章前四节 |
+| **两者叠加** | 服务端兜底 + 自建前置遮蔽省成本 | 混合 | **推荐**：自建 Mask/Snip 先省大头，服务端在极端时兜底 |
+
+- **可叠加**：自建 Mask 先把工具输出遮蔽掉（免费、可逆），服务端压缩在更靠后的阈值兜底，两者不冲突。
+- **context editing 联动**：服务端 context editing 在清除阈值临近时自动警告模型，让它先把要紧的写进 scratchpad 记忆文件，再清除——与"外部记忆层"安全网天然配合。
+- **官方推荐组合**：compaction 保持活跃上下文小且无需客户端记账，memory 保留必须存活于摘要之外的信息。
+
+---
+
+## 硬约束：重建时 head 必须逐字节不变
+
+**何时读本节**：当你实现"上下文重建 / 重注入"逻辑（activeRestore、checkpoint 恢复、跨会话交接）时。
+
+压缩与重建时，**head（system prompt + 任务陈述）必须逐字节不变**。改写 system prompt 会静默摧毁前缀缓存（prefix cache）经济——每次重建都使缓存失效，成本翻倍且延迟上升。
+
+- 任何重建逻辑（activeRestore、checkpoint 恢复、跨会话交接）只能追加/替换 body，不得触碰 head 字节。
+- 注入压缩摘要、文件内容、Plan 时，**插入到 head 之后**，而非修改 head。
+- 在 `CompactionLedger` 记录 `head_unchanged: bool` 断言，观测可据此报警（见 `references/14-observability.md`）。
+- 跨会话的"上下文重置"取舍见 `references/13-long-running-session.md`。
+- 压缩成本（LLM 调用、token 消耗）挂到 Budget 见 `references/06-phase-permissions.md`。
+- 压缩质量观测（压缩频率、各级占比、`head_unchanged` 断言）见 `references/14-observability.md`。
 
 ---
 
@@ -284,6 +426,43 @@ FUNCTION autocompact(messages, targetFreeTokens, llmClient):
 | **Feedback** | 项目/任务级 | 长期存储 | 按反馈时效 | "上次你建议用async，但这里用sync更合适" |
 | **Project** | 项目级别 | 长期存储 | 随项目演进 | 项目结构、技术栈、依赖关系、约定 |
 | **Reference** | 跨项目 | 长期存储 | 按有效期 | API文档摘要、最佳实践片段 |
+
+## 外部记忆层（Scratchpad）
+
+**何时读本节**：当某些信息必须**无损**存活于任意次压缩之外（文件路径、凭据引用、进行中的计划）时。
+
+四分类记忆解决"长期知识沉淀"，但压缩时仍需一个**轻量、可写、外置**的安全网。Scratchpad 是一组简单文本文件，Agent 在压缩前把要紧信息写进去，压缩后再读回来——它**不会**像摘要那样丢信息。
+
+**定位**：压缩的无损安全网。*Notes survive compaction losslessly; summaries do not.*
+
+| 维度 | 四分类记忆 | 外部 Scratchpad |
+|------|-----------|-----------------|
+| 目的 | 长期知识沉淀 | 跨压缩的临时状态锚 |
+| 写入时机 | auto-dream 整合 | 压缩前/关键时刻随手写 |
+| 有损性 | 归纳可能丢细节 | 无损（原文文件） |
+| 介质 | 长期存储/向量DB | 轻量文本文件 |
+
+### 与压缩的协作
+
+- **Compaction + Memory 是官方推荐组合**：compaction 保持活跃上下文小且无需客户端记账，memory 保留必须存活于摘要之外的信息。
+- **context editing 联动**：服务端 context editing 在清除阈值临近时自动警告模型，让它先把要紧的写进 scratchpad 记忆文件，再清除。
+- **外置优于内联**：文件路径、凭据引用、运行中的计划写进笔记，可无损存活任意次压缩；摘要做不到。
+
+### memory tool 路径校验安全约束
+
+```
+class MemoryTool:
+    def write(self, path: str, content: str) -> None:
+        raise NotImplementedError(
+            "AI: canonicalize(path) 后必须仍在记忆根目录下；"
+            "拒绝 ../ 穿越、URL 编码穿越（%2e%2e）、Unicode 等价（NFKC）归一化绕过；"
+            "越界一律抛 SecurityError，绝不静默截断到根目录"
+        )
+```
+
+- `canonicalize` 后用真实绝对路径比对记忆根目录前缀（如 `mem_root/`）。
+- 拒绝 `../`、`..%2f`、Unicode 等价字符等所有穿越变体。
+- 越界写入抛 `SecurityError`，绝不静默降级到根目录（避免写入逃逸到任意路径）。
 
 ### User记忆
 
@@ -490,10 +669,11 @@ BUILD INSTRUCTIONS FOR AI:
    - countMessages(messages: list) → int
    - countStructured(msg: dict) → int  （含 role 和 tool_calls 的 overhead）
 
-2. 压缩管道按 Level 1→4 的顺序实现。
-   每个Level是一个独立类，实现统一的 compress(request)→CompressionResult 接口。
+2. 压缩管道按 **Mask→Snip→Collapse→Autocompact** 的顺序实现（Mask 必为首）。
+   每个 Level 是一个独立类，实现统一的 compress(request)→Optional[CompressionResult] 接口。
    不要在 CompressionPipeline.compact() 中写 if-else 分发——使用策略链模式，
-   每个策略返回 Optional[CompressionResult]，链式尝试直到第一个非None。
+   链式尝试直到第一个非 None：先 Mask，不足再 Snip，再 Collapse，最后 Autocompact。
+   Autocompact 摘要必须用 schema 模板（含 excluded_approaches），并写入 CompactionLedger。
 
 3. MemoryManager 必须是异步安全的。
    短期缓冲区用 asyncio.Lock 保护，长期存储用文件锁或DB事务。
@@ -503,12 +683,13 @@ BUILD INSTRUCTIONS FOR AI:
    每个事件写入后调用 flush()（非 fsync，仅在checkpoint时 fsync）。
    WAL文件按 session_id 命名：wal_{session_id}.jsonl
 
-5. 恢复机制的关键：compaction后必须立即在WAL中写 CHECKPOINT 事件，
-   记录当前压缩级别、剩余token数、待处理任务列表。
-   这使得崩溃恢复时可以知道"压缩到了哪一步"。
+5. 恢复机制的关键：compaction 后必须立即在 WAL 中写 CHECKPOINT 事件，
+   记录当前压缩级别、剩余 token 数、待处理任务列表；同时写一条 CompactionLedger 台账。
+   这使得崩溃恢复时可以知道"压缩到了哪一步"以及"清除了/摘要了什么"。
 
 6. 不要在压缩后丢弃文件内容引用 —— 维护一个 currentFiles[] 列表，
-   每次 compaction 后重新注入到 system prompt 中。
+   每次 compaction 后将文件内容、Skill 上下文、Plan、任务列表**注入到 head 之后**，
+   **不得改写 head（system prompt + 任务陈述）**，以保住前缀缓存经济。
 
 7. hasAttemptedReactiveCompact 标志：
    - 初始化为 false
@@ -525,44 +706,44 @@ BUILD INSTRUCTIONS FOR AI:
 ## Minimal 配置
 
 适用于：原型开发、个人项目、单次短对话。
-- 压缩：仅 Level 1 Snip。Snip阈值设为50条消息。
-- 记忆：不使用。每次对话从头开始。
+- 压缩：仅 Level 1 Mask（工具结果遮蔽）。Snip 阈值设为 50 条消息，一般不触发。
+- 记忆：不使用四分类；可选轻量 scratchpad 备忘。
 - WAL：不使用。崩溃后对话无法恢复。
 - Token计数：允许 `len/4` 估算。
 
 ```
 示例场景：写一个200行的Python脚本，对话不超过30轮。
-压缩永远不触发，上下文完全足够。
+Mask 偶尔遮蔽超长 read_file 输出，其余上下文完全足够。
 ```
 
 ## Professional 配置
 
 适用于：日常开发、中等复杂度项目、多文件编辑。
-- 压缩：完整四级管道。Snip阈值=20条，Microcompact阈值=4000 tokens，Collapse窗口=15条，Autocompact token目标=50%。
-- 记忆：文件级。四分类存储为独立JSON文件，auto-dream仅触发条件B（session结束）。
-- WAL：JSONL文件，每100事件checkpoint一次。
-- Token计数：使用tiktoken精确计数。
+- 压缩：完整四级管道 **Mask→Snip→Collapse→Autocompact**，触发阈值 0.65；Mask 按工具 `outputProfile`（read_file≈8000、bash≈2000），Snip 阈值=20 条，Collapse 窗口=15 条。
+- 记忆：文件级。四分类 + scratchpad 存储为独立 JSON 文件，auto-dream 仅触发条件 B（session 结束）。
+- WAL：JSONL 文件，每 100 事件 checkpoint 一次；压缩同时写 CompactionLedger。
+- Token计数：使用 tiktoken 精确计数。
 
 ```
 示例场景：跨5个文件的bug修复，对话100+轮。
-Level 1-3覆盖95%压缩需求，仅在极端情况下触发Level 4。
+Mask 先清掉工具输出大头，Snip/Collapse 覆盖剩余，仅在极端情况触发 Autocompact。
 ```
 
 ## Enterprise 配置
 
 适用于：持续运行Agent、大型项目、多session协作。
-- 压缩：四级+压缩恢复（compaction后自动重建被压缩的上下文）。
-- 记忆：向量数据库（如Qdrant/Chroma）。四分类各建一个collection。
+- 压缩：四级 + 压缩恢复（compaction 后自动重建被压缩的上下文）+ **外部 scratchpad 安全网** + **服务端压缩叠加**（自建前置遮蔽省成本，服务端极端兜底）。
+- 记忆：向量数据库（如Qdrant/Chroma）。四分类各建一个 collection；scratchpad 落独立文件区。
   - User记忆索引在 `user_preferences` collection
-  - Project记忆增量更新，每次文件变更自动更新embeddings
-  - auto-dream全量触发（条件A+B+C），在后台协程中执行，不阻塞主循环
-- WAL：JSONL + SQLite双写（WAL用于实时恢复，SQLite用于查询统计）。
-- Token计数：模型原生tokenizer + 预留1000 token buffer。
-- 附加值：压缩事件可观测（metrics上报压缩频率、各级别占比、节省token数）。
+  - Project记忆增量更新，每次文件变更自动更新 embeddings
+  - auto-dream 全量触发（条件 A+B+C），在后台协程中执行，不阻塞主循环
+- WAL：JSONL + SQLite 双写；CompactionLedger 独立 append-only 文件。
+- Token计数：模型原生 tokenizer + 预留 1000 token buffer。
+- 附加值：压缩事件可观测（metrics 上报压缩频率、各级占比、节省 token 数、`head_unchanged` 断言命中率）。
 
 ```
 示例场景：持续运行数月的CI/CD Agent。
-Enterprise配置确保跨session记忆连续，压缩管道维持成本可控。
+Enterprise 配置确保跨 session 记忆连续，scratchpad 让要紧信息无损存活任意次压缩。
 ```
 
 ---
@@ -570,14 +751,20 @@ Enterprise配置确保跨session记忆连续，压缩管道维持成本可控。
 # 检查清单
 
 - [ ] tokenCounter使用模型原生tokenizer，非估算
-- [ ] Snip后注入system消息声明"已剪断"
-- [ ] Microcompact按工具类型差异化阈值
-- [ ] Microcompact标记已截断消息，防止重复截断
-- [ ] Context-Collapse不修改原messages数组，仅读时投射
-- [ ] Collapse去重检查（bloom filter）
-- [ ] Autocompact从尾向头扫描，保留最近10条消息
-- [ ] Autocompact摘要使用6字段结构化模板
+- [ ] 压缩触发阈值 60-70%（默认 0.65），非 85%
+- [ ] **Mask 为管道首选**：先于 Snip 执行，按工具 `outputProfile` 差异化阈值
+- [ ] Mask 标记 `masked: true` 防止重复遮蔽，原消息保留仅生成遮蔽视图
+- [ ] Snip 后注入 system 消息声明"已剪断"
+- [ ] Context-Collapse 不修改原 messages 数组，仅读时投射
+- [ ] Collapse 去重检查（bloom filter）
+- [ ] Autocompact 从尾向头扫描，保留最近 10 条消息
+- [ ] **Autocompact 摘要为 schema 化模板，必含 `excluded_approaches`（已排除的方案及原因）**
+- [ ] 每次压缩写入 CompactionLedger（before/after token、cleared、summarized、summary_text 全文）
 - [ ] 压缩后恢复：文件内容、Skill上下文、Plan、任务列表
+- [ ] **重建上下文时 head（system prompt + 任务陈述）逐字节不变**，`head_unchanged` 断言置 true
+- [ ] 外部 scratchpad 与四分类记忆分工明确（无损安全网 vs 长期知识）
+- [ ] memory tool 路径校验：canonicalize 后仍在记忆根目录，拒绝 `../` 与编码穿越
+- [ ] 服务端压缩/context editing 与自建管道可叠加（可选）
 - [ ] hasAttemptedReactiveCompact标志正确维护
 - [ ] 压缩后写入WAL CHECKPOINT事件
 - [ ] 记忆四分类各独立存储，auto-dream对各类用不同策略
@@ -629,7 +816,7 @@ Enterprise配置确保跨session记忆连续，压缩管道维持成本可控。
 - 必须使用模型原生tokenizer（tiktoken或HuggingFace tokenizer匹配模型）
 - 每条消息的token计数必须包含：`role` 字段的markers（~4 tokens）+ 内容本身的tokens + `tool_calls` 结构的JSON overhead
 - 预留5%安全buffer：`effectiveBudget = maxTokens * 0.95`
-- 在budget的85%处触发压缩（而非100%），为压缩过程本身预留操作空间
+- 在 budget 的 60-70% 处触发压缩（而非 85% 或 100%）：为压缩过程本身预留操作空间，且避开 50K token 起的 context rot 退化区，保证 Autocompact 在模型尚可推理时完成
 
 ## 陷阱4：auto-dream阻塞主循环
 

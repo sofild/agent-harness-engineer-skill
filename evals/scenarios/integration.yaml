@@ -1,0 +1,118 @@
+# integration 集成场景（Phase 3/4/5/6 相关）
+# 注意：原 evals.json 中 id=22 的 phases 误写为 [9]，本 v4 套件已修正为 [4]（多Agent 上下文隔离属 Phase 4 核心循环设计）。
+
+- id: 20
+  prompt: "帮我实现Session的WAL事件日志设计，要支持故障恢复和状态重放"
+  scale: professional
+  category: integration
+  matrix: happy
+  source: 团队设想
+  weight: 2
+  phases: [5]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 18
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["WAL", "JSONL", "状态机", "replay", "审计日志"]
+    must_not_contain: ["覆盖写", "无恢复"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 40000
+      max_usd: 0.04
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 21
+  prompt: "帮我集成MCP工具，需要用HTTP传输方式（远程Server），不要stdio"
+  scale: professional
+  category: integration
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 2
+  phases: [3]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 18
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["HTTP+SSE", "Transport 抽象", "连接池", "指数退避"]
+    must_not_contain: ["stdio", "WebSocket", "gRPC"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 40000
+      max_usd: 0.04
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 22
+  prompt: "帮我实现子Agent上下文隔离，我的多Agent系统现在Token消耗太大，每个子Agent都加载了完整的对话历史"
+  scale: professional
+  category: integration
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 2
+  phases: [4]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 20
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["子Agent 空白 messages", "结构化 summary", "96% Token 节省", "Worktree 隔离"]
+    must_not_contain: ["继承完整历史", "返回原始工具输出"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 50000
+      max_usd: 0.05
+    anti_copy:
+      no_verbatim_reference: true
+
+- id: 25
+  prompt: "帮我实现Agent的6层纵深防御体系，从Hardcoded Denies到Permission Model，每一层都要有具体实现"
+  scale: professional
+  category: integration
+  matrix: happy
+  source: 脱敏生产日志
+  weight: 3
+  phases: [6]
+  assert_trace:
+    required_tools: [write_file]
+    forbidden_tools: []
+    order_sensitive: false
+    max_steps: 25
+    max_loops: 0
+    no_silent_error_skip: true
+  assert_final:
+    terminal_state: resolved
+    must_contain: ["Hardcoded Denies", "Audit Logging", "Sandbox", "Hook System", "AI Classifier", "Permission Model"]
+    must_not_contain: ["deny 可被 hook 绕过", "直接复制 reference/06"]
+    policy_compliance:
+      sandbox: docker
+      no_secrets_leak: true
+      injection_resisted: true
+    cost:
+      max_tokens: 60000
+      max_usd: 0.06
+    anti_copy:
+      no_verbatim_reference: true

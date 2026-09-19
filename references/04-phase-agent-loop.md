@@ -2,7 +2,7 @@
 
 ## 目标
 
-设计健壮的Agent主循环——这是Agent系统的**心脏**。v4 版本在 v3 的 `while True` + 7站点 + 状态机 + WAL 日志基础上，融入 2026 年 Loop Engineering 九大技术，形成可配置、可扩展、可观测的现代 Agent 循环架构。
+设计健壮的Agent主循环——这是Agent系统的**心脏**。v4 版本在 v3 的 `while True` + 状态机 + WAL 日志基础上，将 continue 站点扩展为 **8 个**（原 7 个 + v4 新增的 **CONTINUE-SITE-8：Verification Failure**），并融入 2026 年 Loop Engineering 九大技术，形成可配置、可扩展、可观测的现代 Agent 循环架构。
 
 ---
 
@@ -34,7 +34,7 @@ async def run(self, user_input: str) -> str:
 1. **永不退出**：`while True` 是 Agent 循环的绝对基础，不会有"自然结束"——只有达到终止条件才 `break`
 2. **流式事件输出**：使用 `AsyncGenerator` yield 中间事件，调用方可以实时消费进度
 3. **状态机驱动**：状态转换明确，每个 continue 站点检查当前状态
-4. **7个弹性恢复点**：每种失败模式有专属的恢复策略，按严重程度渐进升级
+4. **8个弹性恢复点**：每种失败模式有专属的恢复策略，按严重程度渐进升级（含 v4 新增的 Verification Failure 站点）
 5. **事件日志即真理**：会话事件以 append-only JSONL 形式写入，类比数据库 WAL
 6. **声明式配置驱动**：循环拓扑通过 YAML/JSON 声明，策略切换无需改代码（v4 新增）
 7. **双层循环解耦**：规划与执行分层，减少无效工具调用，提升复杂任务成功率（v4 新增）
@@ -98,6 +98,8 @@ async def run(self, user_input: str) -> str:
      └───────────────────────────────────────────────→ └───────┘
 ```
 
+> **验证失败回路（CONTINUE-SITE-8）**：行动（工具执行 / 文件写入等）完成后，主循环在 `running` 态内调用 `Verifier.verify()`。若确定性检查失败，把**结构化的失败输出**（文件路径 + 行号 + 错误码）作为 sensor 注入下一轮上下文，循环回到 `running` 重新行动；连续 N 次（默认 3）同一错误则升级为 replan 或 `human_required`，离开 `running` 态。该站点与 `max_turns` / 会话超时 / Budget 检查点同级，都是 `running` 态内的退出/回流分支。
+
 **状态枚举**（抽象类骨架）：
 
 ```python
@@ -138,6 +140,13 @@ class AgentRunState:
     consecutive_errors: int = 0
     max_consecutive_errors: int = 3
 
+    # v4 新增：验证失败追踪（CONTINUE-SITE-8）
+    consecutive_verification_errors: int = 0
+    max_consecutive_verification_errors: int = 3  # 连续 N 次同一错误 → 升级 replan / human_required
+
+    # v4 新增：预算检查点（Budget 抽象来自 references/06-phase-permissions.md，不在此重定义）
+    budget: Optional["Budget"] = None  # 由 Phase 6 注入；轮次上限 / 会话超时 / Budget 三选一先到先停
+
     # v4 新增：双层循环状态
     execution_plan: Optional["ExecutionPlan"] = None  # 当前执行计划
     loop_config: Optional["LoopConfig"] = None        # 声明式循环配置
@@ -149,7 +158,7 @@ class AgentRunState:
 
 ### 2. AgentCore 抽象类
 
-> **重要**：以下所有代码片段是**抽象骨架 + 伪代码**，不可直接复制运行。目的是展示接口签名、循环结构和7个 continue 站点的位置关系。
+> **重要**：以下所有代码片段是**抽象骨架 + 伪代码**，不可直接复制运行。目的是展示接口签名、循环结构和8个 continue 站点的位置关系。
 
 ```
 # ─── 抽象 AgentCore 骨架 ───
@@ -159,9 +168,10 @@ class AgentCore:
 
     架构约束:
       - 状态: 单一 AgentRunState 实例，伪不可变（continue 站点必须整体重新赋值）
-      - 输出: AsyncGenerator[AgentEvent, None] —— 每个中间状态作为一个事件 yield
-      - 恢复: 7个 continue 站点覆盖所有已知失败模式
-      - 日志: SessionEventLog 以 append-only JSONL 持久化，每个事件必须在前才能 yield 给调用方
+    - 输出: AsyncGenerator[AgentEvent, None] —— 每个中间状态作为一个事件 yield
+    - 恢复: 8个 continue 站点覆盖所有已知失败模式（含 v4 新增的 Verification Failure 站点）
+    - 预算: 轮次上限、会话超时、Budget 检查点三选一先到先停（Budget 抽象见 references/06-phase-permissions.md）
+    - 日志: SessionEventLog 以 append-only JSONL 持久化，每个事件必须在前才能 yield 给调用方
       - 配置: 支持从 LoopConfig 声明式加载循环策略（v4 新增）
       - 护栏: SafetyGuardLoop 包裹每个行动（v4 新增）
     """
@@ -174,6 +184,8 @@ class AgentCore:
     stop_hooks: List[StopHook]         # 来自 Phase 6
     safety_guard: SafetyGuardLoop      # v4 新增 ★技术9
     loop_config: LoopConfig            # v4 新增 ★技术7
+    verifier: Verifier                 # v4 新增：确定性验证回路（见下文 §11）
+    budget: Budget                     # v4 新增：预算抽象（来自 references/06-phase-permissions.md）
 
     # ═══════════════════════════════════════════════════════════
     # 主循环（伪代码——展示结构而非可运行实现）
@@ -243,6 +255,13 @@ class AgentCore:
             if elapsed > self.state.session_timeout_seconds:
                 self.state.status = AgentState.EXPIRED
                 yield StateChangeEvent(old=RUNNING, new=EXPIRED, reason="session_timeout")
+                break
+
+            # v4 新增：预算检查点（与轮次上限、会话超时同级，三选一先到先停）
+            # Budget 抽象来自 references/06-phase-permissions.md，此处只调用、不重定义
+            if self._budget_exceeded():
+                self.state.status = AgentState.EXPIRED
+                yield StateChangeEvent(old=RUNNING, new=EXPIRED, reason="budget_exhausted")
                 break
 
             # ── 1. 轮次开始 ──
@@ -355,9 +374,53 @@ class AgentCore:
                             {"role": "user", "content": str(tr.content)},
                         ]
 
+                    # ── 7a. 行动后确定性验证（CONTINUE-SITE-8 调用入口）──
+                    # 用确定性验证包裹概率性智能：compile / lint / type / test / schema
+                    # 等计算型检查无需再让 LLM 判断"是否成功"，工具自己知道。
+                    verification = await self.verifier.verify(
+                        artifact=tool_results,
+                        context={
+                            "turn": self.state.turn_number,
+                            "plan": self.state.execution_plan,
+                        },
+                    )
+                    if not verification.passed:
+                        self.state.consecutive_verification_errors += 1
+                        if (self.state.consecutive_verification_errors
+                                >= self.state.max_consecutive_verification_errors):
+                            # 连续 N 次同一错误 → 升级为 replan 或 human_required
+                            # （ErrorKind 分类见 references/08-core-concepts.md）
+                            self.state.messages = [
+                                *self.state.messages,
+                                {"role": "user", "content": self._format_verification_sensor(verification)},
+                            ]
+                            self.state.status = AgentState.EXPIRED
+                            yield StateChangeEvent(
+                                old=RUNNING, new=EXPIRED,
+                                reason="verification_exhausted",
+                            )
+                            self._emit_turn_end(turn_start)
+                            break  # 交还给外层 replan 或人工介入
+
+                        # ★ CONTINUE-SITE-8: Verification Failure
+                        # 恢复策略：把结构化失败输出（文件路径 + 行号 + 错误码）作为
+                        # sensor 注入下一轮上下文——而不是自然语言"失败了"。
+                        self.state.messages = [
+                            *self.state.messages,
+                            {"role": "user", "content": self._format_verification_sensor(verification)},
+                        ]
+                        yield ErrorEvent(
+                            type="verification_failure",
+                            turn=self.state.turn_number,
+                            machine_readable=verification.machine_readable_output,
+                        )
+                        self._emit_turn_end(turn_start)
+                        continue
+
                     # ★ CONTINUE-SITE-7: 正常工具执行完成
                     # ⚠️ 陷阱：has_attempted_reactive_compact 不在此处重置！
                     self.state.consecutive_errors = 0
+                    self.state.consecutive_verification_errors = 0
                     self._emit_turn_end(turn_start)
                     continue
 
@@ -390,7 +453,9 @@ class AgentCore:
                     continue
 
             # ═══════════════════════════════════════════════
-            #  错误恢复：6个恢复性 continue 站点
+            #  错误恢复：8 个 continue 站点的恢复逻辑
+            #  （CONTINUE-SITE-7 为正常路径；CONTINUE-SITE-8
+            #   为行动后确定性验证失败，入口见主循环 7a 段）
             # ═══════════════════════════════════════════════
             except PromptTooLongError as e:
                 # ★ CONTINUE-SITE-2: Prompt Too Long (HTTP 413)
@@ -512,6 +577,21 @@ class AgentCore:
 
     async def _check_breakpoint(self) -> Optional[Dict]:
         """检查是否有管理面板注入的断点"""
+        ...
+
+    # v4 新增：验证失败回路辅助方法
+
+    def _budget_exceeded(self) -> bool:
+        """调用 references/06-phase-permissions.md 的 Budget 抽象判断预算是否耗尽"""
+        ...
+
+    def _format_verification_sensor(self, report: "VerificationReport") -> str:
+        """
+        把验证报告格式化为结构化 sensor 文本，注入下一轮上下文。
+
+        关键：注入的是 machine_readable_output（文件路径 + 行号 + 错误码），
+        而非自然语言"失败了"。LLM 下一轮直接读到可定位的结构化反馈。
+        """
         ...
 ```
 
@@ -1505,11 +1585,111 @@ class HotConfigSource:
         ...
 ```
 
+### 11. Verifier 抽象（确定性验证回路 / Guides & Sensors）★v4 新增
+
+**何时读本节**：当你要回答"Agent 写完代码 / 改完配置后，怎么知道它真的对了"时使用本节。核心论断是 **2026 harness 工程的第一性原则——用确定性验证包裹概率性智能**：TypeScript 编译器报 TS2345，不需要再找一个 LLM 来判断"编译是否成功"，编译器自己知道。lint、类型检查、测试、结构分析都是围绕 Agent 的**快速确定性反馈机制**。
+
+**Martin Fowler 的 guides-and-sensors 模型**（本节的理论底座）：
+- **guides**（行动**前**影响 Agent）：AGENTS.md、架构文档、代码规范、API 文档、安全策略——它们是"应该怎么写"的指引。
+- **sensors**（行动**后**告诉 Agent 发生了什么）：编译错误、测试失败、lint 告警、运行时日志、浏览器结果、安全扫描——它们是"刚才写的对不对"的反馈。
+- 最强的 harness 同时具备**计算型控制**（lint / type / test）与**推断型控制**（AI code review）。两类 sensor 都在行动后回喂，区别只在于"谁来判断"。
+
+```python
+"""
+Verifier：行动后确定性验证回路的抽象接口。
+注意：以下为抽象骨架 + 伪代码，不可直接运行。
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class VerificationKind(Enum):
+    """验证器种类——区分计算型与推断型（见下文明确定位）"""
+    COMPUTATIONAL = "computational"  # 确定性：compile / lint / type / test / schema
+    INFERENTIAL = "inferential"      # 概率性：LLM-based 主观维度评审
+
+
+@dataclass
+class VerificationReport:
+    """验证报告——必须是机器可解析的，才能回喂 LLM 下一轮"""
+    passed: bool
+    kind: VerificationKind
+    findings: List[Dict[str, Any]] = field(default_factory=list)
+    # 机器可读输出：结构化失败定位（文件路径 + 行号 + 错误码）
+    # 这是 CONTINUE-SITE-8 注入下一轮上下文的载荷
+    machine_readable_output: Dict[str, Any] = field(default_factory=dict)
+
+
+class Verifier:
+    """
+    行动后验证抽象。
+
+    架构约束（铁律）:
+      - 计算型优先：能用 compile/lint/type/test/schema 代码化的检查，
+        绝不交给 LLM 判断（编译器自己知道结果，且确定、即时、免费）。
+      - 推断型只用于无法代码化的主观维度（代码可读性、架构契合度、
+        安全语义判断），且不得作为"最终评判者"。
+      - 生成者不得作为自己产出的最终评判者（硬约束，详见
+        references/09-multi-agent.md 的 Evaluator 角色）：
+        Generator 产出的 artifact 必须由独立 Verifier / Evaluator 校验，
+        禁止 self-verify。
+
+    硬约束依据:
+      Anthropic 的 Planner → Generator → Evaluator 三段式强制分离，
+      理由是"Agent 天然是过于乐观的自我评估者"。实测对照：solo agent
+      做复古游戏机项目花了 9 小时但失败；加上 Evaluator 子 agent 的完整
+      harness 跑了 6 小时，产出了可工作的软件。
+    """
+
+    async def verify(
+        self, artifact: Any, context: Dict[str, Any]
+    ) -> VerificationReport:
+        """
+        对 artifact（工具结果 / 文件 / 计划）执行验证。
+
+        Args:
+            artifact: 待验证对象（通常是 CONTINUE-SITE-7 产出的 tool_results）
+            context:  运行上下文（turn_number、execution_plan 等）
+
+        Returns:
+            VerificationReport{passed, findings[], machine_readable_output}
+            —— 必须机器可解析，供 CONTINUE-SITE-8 直接注入下一轮。
+        """
+        raise NotImplementedError("AI: 实现验证逻辑——先跑计算型检查，"
+                                   "必要时再跑推断型检查，并组装 machine_readable_output")
+```
+
+**计算型 vs 推断型定位**：
+
+| 维度 | 计算型（Computational） | 推断型（Inferential） |
+|------|------------------------|----------------------|
+| 判断者 | 编译器 / linter / test runner / schema validator | LLM-based reviewer |
+| 确定性 | 确定（同输入同结果） | 概率（可能不一致） |
+| 延迟 / 成本 | 低（毫秒~秒，免费或极廉） | 高（需多一次 LLM 调用） |
+| 适用 | compile / lint / type / unit / schema / 安全扫描 | 可读性、架构契合、安全语义等主观维度 |
+| 是否可作为最终评判 | 是（且应优先） | 否——只能作为辅助信号 |
+
+**三级规模差异（Verifier 落地）**：
+
+| 维度 | Minimal | Professional | Enterprise |
+|------|:-------:|:-----------:|:----------:|
+| 计算型检查 | 仅 `compile` / `run_tests` 占位 | compile + lint + type + unit | 全链路：compile→lint→type→unit→integration→架构检查→安全扫描（见 `references/07-phase-production.md` 确定性门禁清单） |
+| 推断型检查 | 无 | 可选 AI code review（轻量） | 独立 Evaluator 子 agent（强制分离，见 09） |
+| 生成者自评约束 | 不强制（单 Agent） | 建议独立 reviewer | **强制**：Generator ≠ Evaluator |
+| 输出回喂 | 文本日志 | 结构化 findings 注入上下文 | 结构化 + 聚合到可观测系统 |
+
+**AI 构建提示**：
+- "实现 `Verifier.verify()`：先同步运行计算型检查（compile / lint / type / test），任一失败则 `passed=False` 并填充 `machine_readable_output`（含 file / line / error_code）；只有计算型全过时，才调用可选的 LLM reviewer 处理主观维度。"
+- "确保 `machine_readable_output` 是 dict / JSON，而不是一段自然语言——它会被 CONTINUE-SITE-8 原样注入下一轮 user 消息。"
+- "在 Enterprise 规模，把推断型评审实现为 `references/09-multi-agent.md` 中的 Evaluator 子 agent，绝不要让 Generator 调用 `self.verify()` 判定自己。"
+
 ---
 
 ## AI 构建提示
 
-### 7个 Continue 站点深度说明
+### 8个 Continue 站点深度说明
 
 | # | 站点名称 | 触发条件 | 恢复策略 | 恢复后状态 | 关键陷阱 |
 |---|---------|---------|---------|-----------|---------|
@@ -1520,6 +1700,7 @@ class HotConfigSource:
 | 5 | **Stop Hook Blocking** | 至少一个 Stop Hook 返回 `EXTRA_TURN` 决策 | 将 Hook 指定的额外 prompt 追加到消息历史 | 新轮次开始，给 LLM 额外机会响应 | Stop Hook 自身不能执行耗时操作；它只做判断，不做副作用 |
 | 6 | **Image/Media Errors** | 发送的图片超过模型尺寸限制（如 Anthropic 的 `image_too_large`） | 从指定索引的消息中移除/压缩问题图片 | 移除图片后的消息历史重试 | 移除图片后语义可能改变；需要通知调用方图片已被剥离 |
 | 7 | **Tool Execution** | LLM 返回 `stop_reason == "tool_use"`，要求调用工具 | 执行工具并将结果追加到消息历史 | 新轮次开始，LLM 接收工具结果继续推理 | 这是正常的循环路径，不是"错误"；但需要重置 consecutive_errors 计数器 |
+| 8 | **Verification Failure** | 行动后 `Verifier.verify()` 确定性检查返回失败（compile / lint / type / test / schema 等） | 把结构化失败输出（文件路径 + 行号 + 错误码）作为 sensor 注入下一轮；连续 N=3 次同一错误升级 replan / human_required | 循环回到 running 重新行动；超限则离开 running，交还外层 replan 或人工介入 | 不要注入自然语言"失败了"；验证报告必须是 machine_readable，可被 LLM 下一轮直接消费 |
 
 ### 恢复策略升级链
 
@@ -1540,6 +1721,23 @@ class HotConfigSource:
     ├─→ 站点6: Image Error → 移除问题媒体
     └─→ 站点7: Tool Execution → 正常循环
 ```
+
+### ErrorKind 映射表（与 08 联动）
+
+每个 continue 站点本质上对应 `references/08-core-concepts.md` 定义的五类 `ErrorKind` 之一：**retryable（可重试）/ fatal（致命）/ degrade（降级）/ replan（需重规划）/ human_required（需人工）**。下方只做映射与理由说明，分类的权威定义以 08 为准。
+
+| # | 站点 | 对应 ErrorKind | 为什么 | 本文件中的处理 |
+|---|------|---------------|--------|----------------|
+| 1 | Proactive Compaction | `degrade` | 上下文超限不是错误，是主动降级以保住循环 | 压缩后同轮重试，不计入致命 |
+| 2 | Prompt Too Long | `retryable` → 失败转 `degrade` | 413 可经压缩恢复；压缩失败才降级 | reactive / aggressive 两级降级 |
+| 3 | Max Output Tokens | `retryable` | 追加 continue 即可续写，确定可恢复 | continue prompt 续写 |
+| 4 | Fallback Model | `degrade` | 主模型不可用，降级到备选模型继续 | 模型切换后重试 |
+| 5 | Stop Hook Blocking | `replan` | Hook 要求额外轮次，等价于局部重规划 | 注入 extra_prompt 重跑 |
+| 6 | Image/Media Errors | `retryable` | 移除问题媒体后通常可恢复 | 剥离媒体重试 |
+| 7 | Tool Execution | （正常路径，非 ErrorKind） | 不是失败，是循环的正常推进 | 重置计数器，进入下一轮 |
+| 8 | Verification Failure | `replan` → 连续 N 次转 `human_required` | 确定性检查失败需改方案；反复失败说明需人工/重规划 | 注入结构化 sensor；超限升级（见 08） |
+
+> 注意：站点 8 的升级终点 `human_required` 与 08 的 `human_required` 语义一致——连续同一验证错误 N 次后，Agent 不应继续空转，应把结构化失败输出交给人工或外层 replan。
 
 ### AsyncGenerator 流式模式
 
@@ -1772,7 +1970,7 @@ class SessionEventLog:
 
 ```
 特征:
-  - 完整 7 个 continue 站点
+  - 完整 8 个 continue 站点（含 Verification Failure 站点）
   - 状态机：idle / running / expired / error（无 paused）
   - 指数退避重试（consecutive_errors 计数器 + max_consecutive_errors 上限）
   - 轮次上限 + 单级超时
@@ -1831,16 +2029,19 @@ class SessionEventLog:
 ## 检查清单
 
 - [ ] 主循环是真正的 `while True`，不会在首次文本响应时退出
-- [ ] 7个 continue 站点全部有专属的错误类型匹配（不是通用的 `except Exception`）
+- [ ] 8个 continue 站点全部有专属的错误类型匹配（不是通用的 `except Exception`）
 - [ ] `has_attempted_reactive_compact` 在站点2触发前检查，防止 dead loop
 - [ ] `consecutive_errors` 在站点7（正常工具执行）后重置为 0
+- [ ] `consecutive_verification_errors` 在站点7（验证通过）后重置为 0
+- [ ] CONTINUE-SITE-8：行动后有 `Verifier.verify()` 调用，失败时将**结构化** sensor 注入下一轮（非自然语言）
+- [ ] 连续 N=3 次同一验证错误会升级为 replan / `human_required`（对应 `references/08-core-concepts.md`）
 - [ ] 状态机状态转换合法（idle→running→{idle|expired|error}，running→paused→running）
 - [ ] 会话超时使用 `time.monotonic()` 而非 `time.time()`（不受系统时钟调整影响）
 - [ ] 流式响应时 `assistant_text` 块正确累积（不能丢失，不能重复）
 - [ ] 工具结果以"整体替换"语义追加到 `state.messages`（不原地修改）
 - [ ] Stop Hook 内部不执行网络调用、文件 I/O、或其他重量操作
 - [ ] SessionEventLog 是 append-only，事件先写盘再 yield
-- [ ] 轮次上限和会话级超时都作为 break 条件检查
+- [ ] 轮次上限、会话级超时、Budget 检查点都作为 break 条件检查（三选一先到先停）
 - [ ] 备选模型（fallback）有匹配的上下文窗口和工具支持
 - [ ] v4 新增: 声明式配置可以正确切换 ReAct / Plan-Execute / Maker-Checker 策略
 - [ ] v4 新增: 双层循环的 Outer/Inner 上下文正确隔离
@@ -1957,6 +2158,28 @@ if response.has_tool_uses:
 loop = LoopConfigEngine.from_yaml("loop.yaml")
 # 运行时自动根据 config.type 选择正确的循环实现
 ```
+
+### 陷阱9：让生成者自己判定产出（v4 新增）
+
+```python
+# ❌ 错误：Generator 调用 self.verify() 评判自己刚写的代码
+result = await self._write_code(task)
+if await self.verify(result):   # 同一 Agent 既写又判
+    return result
+# Agent 天然是过于乐观的自我评估者，会"觉得没问题"
+
+# ✅ 正确：产出交给独立 Verifier / Evaluator（见 references/09-multi-agent.md）
+report = await self.verifier.verify(artifact=result, context={...})
+if not report.passed:
+    # 把结构化 sensor 注入下一轮，让 Generator 重新行动
+    self.state.messages = [
+        *self.state.messages,
+        {"role": "user", "content": self._format_verification_sensor(report)},
+    ]
+    continue
+```
+
+**修正**：计算型检查（compile / lint / type / test）天然是独立判断，优先使用；推断型评审必须交由独立 Evaluator 子 agent，禁止 `self.verify()`。这也呼应 Martin Fowler 的 sensors 模型——传感器是外部的客观反馈，不是 Agent 对自己的主观打分。
 
 ---
 

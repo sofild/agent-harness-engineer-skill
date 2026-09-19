@@ -178,6 +178,119 @@ Buckets: [30, 60, 120, 300, 600, 1800, 3600]
 计算: 基于模型的公开定价 (input_tokens * price_in + output_tokens * price_out)
 ```
 
+### 质量指标层（v4 新增）
+
+> 共识：Agent 可观测性已从"性能/成本"扩展到三层——**任务完成（Task Completion）/ 轨迹质量（Trajectory Quality）/ 安全合规（Safety & Compliance）**。性能与成本指标（上一节）只能回答"系统有没有坏"，质量指标回答"系统做得对不对、安全不安全"。
+
+**何时读本节**：当你发现"延迟正常、错误率为零、成本也在预算内，但用户仍在抱怨 Agent 答非所问"时，说明你只有性能可观测、没有质量可观测。本节定义生产环境必须采集的质量指标。
+
+#### 三层质量指标映射
+
+| 层级 | 回答的问题 | 本层指标 |
+|---|---|---|
+| 任务完成 | 任务最终做完了吗？花了多少？ | `cost_per_task`、`steps_per_task`、`error_recovery_rate`、`escalation_rate` |
+| 轨迹质量 | 过程走对了路吗？有没有绕、有没有卡？ | `tool_selection_accuracy`、`loop_detection_count` |
+| 安全合规 | 有没有做违规的事 / 被攻陷？ | `policy_violation_rate`、`injection_resistance` |
+
+#### 质量指标定义（8 项）
+
+```
+指标名称: agent_tool_selection_accuracy
+层级: 轨迹质量
+类型: Gauge (滑动窗口均值)
+定义: 模型在每一步"该调用哪个工具"的决策正确的比例
+计算口径: 正确决策数 / 总工具决策数。
+         判定"正确"需 judge（LLM-as-judge 或规则校验）：该步是否应调用此工具、参数是否匹配意图。
+标签: {model, tool_name}
+告警: 周环比下降 > 20% 触发（见"生产回流"趋势告警，按相对基线而非绝对阈值）
+```
+
+```
+指标名称: agent_steps_per_task
+层级: 任务完成
+类型: Histogram
+定义: 单个任务从开始到结束平均执行的步数（1 step = 1 次 LLM 决策 + 1 次执行）
+计算口径: 总 step 数 / 已完成任务数
+Buckets: [1, 3, 5, 8, 12, 20, 40]
+用途: 步数激增 = 绕路/循环前兆；骤降 = 过早放弃
+告警: 周环比 > 30% 移动触发
+```
+
+```
+指标名称: agent_loop_detection_count
+层级: 轨迹质量
+类型: Counter
+定义: 单位时间内被检测到"重复/无有效进展"的轨迹数
+计算口径: 同一 session 内连续 N 步语义相似度 > 阈值或相同动作重复，计 1 次
+标签: {loop_kind: semantic_repeat|identical_action|no_progress}
+用途: 循环工程有效性验证、max_iterations 调参
+```
+
+```
+指标名称: agent_error_recovery_rate
+层级: 任务完成
+类型: Gauge
+定义: 遇到错误但最终仍成功的任务比例
+计算口径: 遇到 >=1 次错误的任务中，最终 status=completed 的数量 / 遇到错误的任务数
+用途: 韧性评估；硬故障立竿见影，但恢复率慢漂移只能靠趋势抓（见"生产回流"）
+```
+
+```
+指标名称: agent_policy_violation_rate
+层级: 安全合规
+类型: Gauge
+定义: 策略约束被触碰/违反的决策比例
+计算口径: 触发 BLOCK 级规则或 strategy 约束被违反的次数 / 总决策数
+标签: {policy_id, severity}
+用途: 安全兜底有效性（与 references/06-phase-permissions.md 联动）
+告警: 任何 > 0 的 BLOCK 级违规都应升级（绝对阈值 = 0，安全项不趋势化）
+```
+
+```
+指标名称: agent_injection_resistance
+层级: 安全合规
+类型: Gauge
+定义: 对抗用例（prompt injection）通过率
+计算口径: 通过注入测试的用例数 / 总对抗用例数
+来源: 对抗用例沉淀自生产失败（见"生产回流" + references/15-evaluation.md）
+注意: 这是离线/评测集指标，生产侧以 policy_violation_rate 近似监控
+```
+
+```
+指标名称: agent_escalation_rate
+层级: 任务完成
+类型: Gauge
+定义: 升级到人工的任务比例
+计算口径: status=escalated 的任务数 / 总任务数
+标签: {escalation_reason}
+告警: 周环比 > 20% 移动 = 真信号；4.1%→4.3% 是噪声，勿按绝对阈值告警
+```
+
+```
+指标名称: agent_cost_per_task
+层级: 任务完成
+类型: Histogram
+定义: 单个任务的端到端成本（非累计、非单 turn）
+计算口径: sum(该 session 内所有 LLM 调用的 input*price_in + output*price_out)
+          + 外部工具成本（若有按次计费）
+          + 人工升级成本分摊（optional）
+        再对已完成任务取分布
+Buckets: [0.01, 0.05, 0.1, 0.5, 1, 5, 20]
+与 agent_estimated_cost_dollars_total 的区别: 后者是 Counter（全局累计），
+        本指标是任务级均值/分布，用于"每个任务花多少"而非"总共花多少"
+告警: 相对 trailing baseline 周环比 > 25% 触发（不是绝对 threshold）
+```
+
+#### 质量指标三档差异表
+
+| 规模 | 采集的质量指标 | 计算方式 |
+|---|---|---|
+| **Minimal** | 不采集 | — |
+| **Professional** | `cost_per_task`、`steps_per_task` | 同步简单统计（Histogram/Counter） |
+| **Enterprise** | 全 8 项 | 异步 judge + 三层质量面板（Grafana） |
+
+**AI 构建提示**：质量指标多数依赖异步 judge（见"生产回流"），不需要每次调用实时计算。Minimal 不采集；Professional 仅采 `cost_per_task` + `steps_per_task`；Enterprise 全量采集并展示三层质量面板。安全合规层指标（`policy_violation_rate`、`injection_resistance`）的告警方向由 `references/06-phase-permissions.md` 的 Budget/策略定义派生。
+
 ### Prometheus 导出端点
 
 ```
@@ -223,7 +336,7 @@ agent_llm_latency_seconds_bucket{model="claude-4",le="2"} 230
 
 | 级别 | 含义 | 使用场景 | 环境 |
 |---|---|---|---|
-| **DEBUG** | 开发调试信息 | 工具调用参数详情、LLM prompt 全文、沙箱配置详情 | 开发环境 |
+| **DEBUG** | 开发调试信息 | 工具调用参数的**字段名与长度（不含值）**、沙箱配置维度、Span 调试元数据 | 开发环境（仍受"日志脱敏规则"约束，禁止记录 prompt 全文与入参原文） |
 | **INFO** | 正常操作记录 | Turn 开始/结束、工具执行结果、权限检查通过 | 所有环境 |
 | **WARN** | 需要关注但不影响功能 | 权限被拒绝、工具调用超时重试、压缩频繁触发、接近速率限制 | Staging + 生产 |
 | **ERROR** | 功能异常 | 工具调用失败、LLM API 错误、沙箱崩溃、会话恢复失败 | 所有环境 |
@@ -238,6 +351,46 @@ agent_llm_latency_seconds_bucket{model="claude-4",le="2"} 230
 | `session_id` | Session 对象 | 关联同一会话的所有日志 |
 | `turn_number` | Session turn 计数器 | 定位具体轮次 |
 | `model` (条件) | LLM 调用上下文 | 定位模型相关问题 |
+
+### 日志脱敏规则（v4 新增）
+
+**何时读本节**：在配置任何结构化日志前。Agent 日志极易误记 prompt 全文与工具入参，造成数据泄露与合规风险——这是上线前的硬门槛。
+
+**默认禁止记录的字段**（任何环境、任何级别均不记录）：
+
+| 禁止字段 | 风险 |
+|---|---|
+| prompt / LLM 输入全文 | 可能含用户 PII、商业机密 |
+| 工具入参原文（arguments 全文） | 可能含密钥、路径、敏感数据 |
+| 凭证 / secret / token / API key | 直接泄露凭据 |
+| 文件内容正文 | 可能含源码机密、用户数据 |
+
+> 即使在 DEBUG 级别，也**不得**记录上述字段。上表"日志级别使用规范"中旧版"DEBUG 记录 LLM prompt 全文、工具调用参数详情"已被本规则废止——DEBUG 仅允许记录字段名与长度，不允许记录值。
+
+**允许记录的字段白名单**：
+
+| 字段 | 说明 | 示例 |
+|---|---|---|
+| `session_id` | 会话标识 | `sess-abc123` |
+| `turn_index` | 轮次序号 | `3` |
+| `tool_name` | 工具名（不含参数） | `write_file` |
+| `tool_status` | 工具结果状态 | `success` / `error` |
+| `error_kind` | 错误类型（不含堆栈中的敏感值） | `timeout` |
+| `latency_ms` | 耗时 | `2300` |
+| `token_count` | token 数（不含文本） | `12000` |
+| `cost_usd` | 成本（不含计费密钥） | `0.025` |
+| `loop_kind` | 循环类型 | `semantic_repeat` |
+| `policy_id` | 触发的策略 ID（不含规则正文） | `P-07` |
+
+**日志脱敏三档差异表**：
+
+| 规模 | 脱敏实现 |
+|---|---|
+| **Minimal** | 不记录任何日志，自然满足白名单 |
+| **Professional** | 结构化日志 + 白名单字段过滤（记录前裁剪禁止字段） |
+| **Enterprise** | 白名单过滤 + 集中脱敏网关 + 审计留痕 |
+
+**AI 构建提示**：实现一个 `redact(event)` 函数，在 `logger.info(...)` 前强制只保留白名单字段、丢弃禁止字段；任何新增日志字段都必须先在白名单登记，未经登记默认不记录。生产 trace 导出为评测用例（见"生产回流"）前必须先过此脱敏。
 
 ---
 
@@ -268,8 +421,71 @@ Session 的 append-only 事件日志天然就是审计日志。无需为 Agent �
 | LLM 高延迟 | `histogram_quantile(0.99, agent_llm_latency_seconds) > 30` | Warning | 检查 API 状态页，考虑降级到更快模型 |
 | 压缩风暴 | `rate(agent_compactions_total[1m]) > 10` | Warning | 检查上下文大小配置，可能需增大 context window |
 | 工具调用异常 | `rate(agent_tool_calls_total{status="error"}[5m]) > 0.1 * rate(agent_tool_calls_total[5m])` | Critical | 检查具体工具的错误分布，可能需回滚工具变更 |
-| 成本异常 | `rate(agent_estimated_cost_dollars_total[1h]) > threshold` | Warning | 检查是否有 Agent 进入无限循环，需人工介入 |
+| 成本异常 | `rate(agent_estimated_cost_dollars_total[1h]) > budget.hourly_limit`（权威定义在 references/06-phase-permissions.md 的 Budget，本文件不重定义该值） | Warning | 检查是否有 Agent 进入无限循环，需人工介入 |
 | 会话积压 | `agent_active_sessions > max_concurrent * 0.8` | Warning | 扩容 Harness 实例或限流新会话 |
+
+---
+
+## 生产回流与趋势告警（v4 新增）
+
+**何时读本节**：当你的质量指标只在离线评测里好看、线上却持续劣化却无人察觉时。本节定义如何把线上生产数据抽样回流成评测信号，并只靠"趋势"而非"绝对阈值"抓慢漂移。
+
+### 为什么必须趋势化
+
+> 技术依据：硬故障立竿见影，慢漂移只能靠趋势抓。例：工具选择准确率从 92% 掉到 78%，单看每天都"正常"，只有周环比趋势能暴露。
+> 按绝对阈值告警的团队，最终都会把告警频道 mute 掉——因为 4.1% 升到 4.3% 这种噪声会淹没真信号。真信号是**周环比 20% 的升级率移动**。
+
+### 生产采样回流
+
+```
+采样率: 生产流量 1-5%（默认 2%）
+抽样方式: 按 session_id 哈希分流，保证同一任务轨迹完整入样
+judge: 与生产评测使用**同一个 judge**（LLM-as-judge 或规则），避免线上线下口径不一致
+评分时机: 异步、离线批处理，不阻塞主链路
+看什么: 分布漂移（drift），不是绝对分数。
+        一个任务 0.91 分没有意义，分布从 [0.95,0.97] 漂到 [0.80,0.85] 才有意义
+```
+
+### 趋势告警规则（相对 trailing baseline）
+
+```
+原则: 所有质量/成本告警以 trailing baseline（近 7 天滚动窗口）为基准，超相对变化才告警
+
+agent_escalation_rate:     周环比 > 20% 且绝对量 >= 5 例  → Warning
+agent_tool_selection_accuracy: 周环比 < -20%             → Critical
+agent_steps_per_task:      周环比 > 30%                  → Warning
+agent_cost_per_task:       周环比 > 25%                  → Warning
+agent_policy_violation_rate: 任何 BLOCK 级违规 (绝对 = 0) → Critical（安全项例外，不趋势化）
+
+# 伪 PromQL：告警方向由基线派生，非写死阈值
+rate(agent_escalation_rate) > 1.2 * baseline(agent_escalation_rate, 7d)
+```
+
+### 失败沉淀为 golden set
+
+```
+闭环: 每条生产失败（status=error|escalated|policy_violation）必须沉淀为一条 golden set 用例
+去向: references/15-evaluation.md 定义的评测集（回归 + 对抗）
+目的: 防止同类失败复发；injection_resistance 的对抗用例即来源于此
+```
+
+### 与 references/15-evaluation.md 打通
+
+| 流向 | 说明 | 实现 |
+|---|---|---|
+| 评测 → 面板 | 评测结果（score / 分层）回灌可观测面板，与线上质量指标同屏对比 | Langfuse Scores → Grafana annotation |
+| trace → 用例 | 任意生产 trace 可一键导出为评测用例（保留 session_id / tool_name / error_kind，脱敏后） | "Export as eval case" 按钮 |
+| 用例 → 回流 | golden set 用例随生产采样共同进入 judge，构成回归基线 | 见上"失败沉淀" |
+
+### 生产回流三档差异表
+
+| 规模 | 采样回流 | judge | 趋势告警 |
+|---|---|---|---|
+| **Minimal** | 否 | — | — |
+| **Professional** | 否（仅离线评测，参照 references/15-evaluation.md） | 离线批处理 | 仅 `cost_per_task` 周环比 |
+| **Enterprise** | 1-5% 生产采样 | 同一 judge 异步 | 全量相对基线 |
+
+**AI 构建提示**：生产回流的所有 judge 调用必须异步，绝不能阻塞用户主链路；回流入样的 trace 导出为评测用例前必须先走"日志脱敏规则"白名单过滤。
 
 ---
 
@@ -376,6 +592,7 @@ class Breakpoint:
     reason: str                        # 注入原因
     created_by: str                    # 操作者
     created_at: str                    # 创建时间
+    kind: str = "approval"             # "approval" 审批类 | "block" 阻断类（v4 修正，见下文语义）
 
 
 class BreakpointManager:
@@ -449,9 +666,44 @@ class ObservableLoop:
         ...
 
     async def _request_human_approval(self, bp: Breakpoint) -> Dict:
-        """向管理面板发送人工审批请求，等待响应（带超时）"""
+        """向管理面板发送人工审批请求，等待响应（带超时）。
+
+        超时行为由 bp.kind 决定（v4 修正）：
+          - "approval" 审批类：超时自动放行，避免阻塞（记录审计日志）
+          - "block"   阻断类：超时保持阻断并升级告警，绝不自动放行
+        """
         ...
+
+### 断点语义：审批类 vs 阻断类（v4 修正）
+
+> 已拍板的安全保守方向：BLOCK 级规则的兜底不能在"审批超时"时失效。"超时自动放行"只适用于审批类，不适用于阻断类。
+
 ```
+审批类 (approval)                阻断类 (block)
+┌──────────────────┐           ┌──────────────────────┐
+│ 超时 → 自动放行   │           │ 超时 → 保持阻断        │
+│ 记录审计日志      │           │        + 升级告警       │
+│ 用于人工复核      │           │ 用于安全兜底           │
+│ 非危险操作        │           │ BLOCK 级规则 / 高危操作 │
+└──────────────────┘           └──────────────────────┘
+```
+
+| 维度 | 审批类 approval | 阻断类 block |
+|---|---|---|
+| 适用场景 | 人工复核非危险操作 | BLOCK 级安全规则、高危写操作 |
+| 超时（默认 300s） | **自动放行**（避免死锁） | **保持阻断 + 升级告警**（兜底不失效） |
+| 审计要求 | 记录"超时放行"事件 | 记录"超时阻断+升级"事件 |
+| 关联规则 | references/06-phase-permissions.md 的审批类 | 同文件 BLOCK 级规则 |
+
+**断点语义三档差异表**：
+
+| 规模 | 断点支持 |
+|---|---|
+| **Minimal** | 不使用断点 |
+| **Professional** | 仅审批类（同步确认，超时放行） |
+| **Enterprise** | 审批类 + 阻断类（阻断类超时升级告警） |
+
+**AI 构建提示**：实现 `_request_human_approval` 时，先读 `bp.kind` 再决定超时策略；阻断类超时必须调用告警升级通道（而非返回 approved=True），这正是安全兜底的失效点，绝不可"为防死锁而放行"。
 
 ## 管理面板能力清单
 
@@ -484,7 +736,9 @@ Enterprise 级别：
 
 关键约束：
   □ 断点检查不得阻塞主循环超过 10ms（异步检查 Redis/配置中心）
-  □ 人工审批超时后必须自动放行（避免死锁，但记录审计日志）
+  □ 人工审批超时策略由 bp.kind 决定（v4 修正）：
+      - 审批类 (approval)：超时自动放行，但记录审计日志（避免死锁）
+      - 阻断类 (block)：超时保持阻断并升级告警，绝不自动放行（否则安全兜底失效）
   □ 热修改变更必须记录在 WAL 中（type: CONFIG_CHANGE）
   □ 断点配置持久化到 Redis，防止管理面板重启后丢失
   □ 策略 A/B 分流基于 trace tag，不影响主循环逻辑

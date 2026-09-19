@@ -16,16 +16,18 @@
 - Git 状态: 分支、变更、提交历史
 - CI/CD 状态: 构建结果、部署状态
 
-**上下文压缩（四级管道）：**
+**上下文压缩（四级管道，v4 已重排顺序）：**
 
 ```
-Level 1: Snip（历史截断）
+Level 1: Mask（工具结果遮蔽 / 清除）       ★ v4 提为首选
+  - 成本：极低 | 延迟：~0ms
+  - 确定、免费、可逆、有 DEV 能力时不降准确率
+  - 实测：观察遮蔽带来约 52% 成本下降 + 约 2.6% 解决率提升
+         （JetBrains《The Complexity Trap》, arXiv 2508.21433）
+
+Level 2: Snip（历史截断）
   - 成本：极低 | 延迟：~0ms
   - 释放少量 token
-
-Level 2: Microcompact（老化工具结果缩减）
-  - 成本：低 | 延迟：~1ms
-  - 边界消息延迟到 API 响应后
 
 Level 3: Context-Collapse（读时投射，不修改数组）
   - 成本：中 | 延迟：~5ms
@@ -35,9 +37,18 @@ Level 3: Context-Collapse（读时投射，不修改数组）
 Level 4: Autocompact（LLM 全对话摘要）
   - 成本：高 | 延迟：~2s
   - 仅在前面三级无法解决问题时触发
+  - 每次压缩写 CompactionLedger，摘要 schema 必须含"已排除的方案及原因"
 ```
 
-**渐进式压缩经济学**：四级本质是成本阶梯，每一级仅在前一级不足时触发。90% 的日常情况由 Snip 解决，避免"用大炮打蚊子"。
+**渐进式压缩经济学**：四级本质是成本阶梯，每一级仅在前一级不足时触发。
+
+- **默认先遮蔽，靠实力才用摘要** —— 遮蔽确定且免费，摘要有损且昂贵；
+  纯摘要省下同样的预算，却让轨迹最多变长 15%。
+- **触发阈值 60-70%（默认 65%），不是 85%** —— 200K 窗口的模型在约 50K token 处
+  就开始可测量退化；触发太晚意味着摘要器自己已在退化区间里工作。
+- **外置记忆优于内联携带**：文件路径、凭据引用、运行中的计划写进 scratchpad，
+  可无损存活任意次压缩；摘要做不到。
+- 详见 `references/05-phase-context.md`。
 
 ### Architectural Constraints（架构约束）
 
@@ -142,7 +153,7 @@ Harness 的无状态性不是"设计选择"，而是**架构必然性**——如
 │    2. 构建系统提示 + 规范化消息       │  ← 提示注入 + 缓存前缀
 │    3. 调用 LLM API（流式）           │  ← 模型推理
 │    4. 收集 tool_use 块               │  ← 工具调用收集
-│    5. 错误恢复（7 个 continue 站点）  │  ← 容错路径
+│    5. 错误恢复（8 个 continue 站点）  │  ← 容错路径
 │    6. 权限检查 → 工具执行            │  ← 6 层防御链
 │    7. Stop Hook → 终止或继续         │  ← 退出门控
 │    8. 追加事件到 Session → CONTINUE  │  ← 持久化，然后循环
@@ -346,10 +357,101 @@ LLM API（Anthropic Claude、OpenAI 等）的 Prompt Cache 按照**消息前缀*
 
 ---
 
-## 十大设计哲学
+## 错误分类与可重试语义（优化 A3）
+
+**何时读本节**：当你要设计任何错误恢复、重试、降级或人工介入路径，或要理解 `references/04-phase-agent-loop.md` 的 continue 站点、`references/06-phase-permissions.md` 的权限决策、`references/10-mcp-integration.md` 的 MCP 错误处理为何"说同一种语言"时。
+
+过去错误是散文式清单（PromptTooLong / MaxOutputTokens / ModelUnavailable / ImageTooLarge / ContextTooLong / RetriableAPI / Irrecoverable），散落在 04 / 06 / 10 三处，没有统一的 `ErrorKind` 抽象，也没有退避上限与"权限拒绝能否换路径重试"的判定。本节将其收敛为一套可复用的语义。
+
+### ErrorKind 五类枚举与处理契约
+
+| ErrorKind | 含义 | 处理契约 | 典型动作 |
+|-----------|------|---------|---------|
+| `retryable` | 瞬时、可自愈的故障 | **立即重试**（带退避），耗尽次数后升级 | 重发请求、换可用 region |
+| `fatal` | 不可恢复的结构性失败 | **终止**当前任务，记录 `error_event` | 配置错误、不可解析的协议破坏 |
+| `degrade` | 资源/精度受限但可降级 | **换小模型或降精度**，不改计划继续 | 降输出粒度、缩小图像、collapse 上下文 |
+| `replan` | 当前计划前提已失效 | **回到 Planner** 重新规划 | prompt 超窗后压缩再规划 |
+| `human_required` | 需外部授权或判断 | **挂起等待**，不自动推进 | 权限拒绝、模糊的业务决策 |
+
+### 退避参数默认值
+
+所有 `retryable` / `degrade` 重试必须挂在 `references/06-phase-permissions.md` 的 Budget 上——无预算则禁止重试（无上限重试是最常见的成本事故来源）。默认退避：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `base` | 1s | 初始退避基数 |
+| `factor` | 2 | 指数增长因子 |
+| `max` | 30s | 单次退避上限 |
+| `jitter` | 全抖动（full jitter） | 在 `[0, next]` 间随机，避免惊群 |
+| `max_attempts` | 5 | 超过即升级到 `fatal` 或 `human_required` |
+
+```
+retry_after = random(0, min(max, base * factor ** attempt))
+总重试窗口受 Budget 硬约束：Budget 耗尽 → 停止重试 → fatal / human_required
+```
+
+### 幂等性要求
+
+重复重试既是成本事故，也可能是重复副作用事故。工具必须在声明时标注 `idempotent: bool`：
+
+| 类别 | `idempotent` | 重试策略 |
+|------|--------------|---------|
+| 只读/查询类（read、search、stat、list、get_status） | `true` | 可安全直接重试 |
+| 写入/副作用类（write、send_email、create_payment、post_message、deploy） | `false` | 重试前必须带幂等键（idempotency-key）或去重；否则升级为 `human_required` |
+
+### 安全方向：permission deny 不属于可自动重试集合
+
+`references/06-phase-permissions.md` 的权限决策若返回 **deny**，错误类别为 `human_required`，**绝不进入 `retryable` 自动重试**。换路径重试（如换一个工具绕过 deny）等同于绕过安全不可变量，需人工或策略显式授权。
+
+### 散文式错误 → ErrorKind 映射表
+
+| 旧错误名（散文式） | ErrorKind | 处理契约 | 备注 |
+|--------------------|-----------|---------|------|
+| PromptTooLong | `replan` | 回到 Planner | 先压缩上下文再重规划 |
+| MaxOutputTokens | `degrade` | 降精度/流式续写 | 减小输出粒度或分片 |
+| ModelUnavailable | `retryable` | 立即重试（退避） | 瞬时故障 |
+| ImageTooLarge | `degrade` | 降精度/缩小后重试 | 不改计划 |
+| ContextTooLong | `degrade` | collapse/压缩 | 触发四级管道 |
+| RetriableAPI | `retryable` | 立即重试（退避） | 显式可重试标记 |
+| Irrecoverable | `fatal` | 终止 | 结构性失败 |
+
+> 补充：`permission deny`（来自 06 权限决策）→ `human_required`，不在 `retryable` 集合内。
+
+### 抽象接口骨架（非可执行实现）
+
+```
+class ErrorKind(Enum):
+    RETRYABLE / FATAL / DEGRADE / REPLAN / HUMAN_REQUIRED
+
+    def handling_contract(self) -> str:
+        raise NotImplementedError(
+          "AI: 实现该类错误的处理契约（重试/终止/降级/重规划/挂起），"
+          "并耦合 references/06-phase-permissions.md 的 Budget 与退避参数")
+
+class RetryPolicy:
+    base=1.0; factor=2.0; max=30.0; jitter="full"; max_attempts=5
+    def next_delay(self, attempt: int) -> float:
+        raise NotImplementedError("AI: 实现全抖动退避，并校验 Budget 余量")
+
+class ToolSpec:
+    name: str
+    idempotent: bool   # 副作用类必须 false，重试前需幂等键
+    def classify_error(self, err) -> ErrorKind:
+        raise NotImplementedError("AI: 将底层异常映射到五类 ErrorKind")
+```
+
+### 三处共用同一套语义
+
+- **`references/04-phase-agent-loop.md` 的 8 个 continue 站点**（含 Verification Failure）：每个站点捕获的错误都先 `classify_error → ErrorKind`，再按处理契约分流。
+- **`references/06-phase-permissions.md` 的权限决策**：deny → `human_required`；Budget 是所有重试的总闸。
+- **`references/10-mcp-integration.md` 的 MCP 错误处理**：第三方工具错误同样归入五类，MCP 工具声明 `idempotent` 以决定重试安全性。
+
+---
+
+## 十一大设计哲学
 
 1. **Async Generator 流式架构**: 不是返回最终结果，而是 yield 每一个中间事件。上层消费方可以选择性订阅。
-2. **通过 Continue 站点实现状态机**: `while(true)` + 7 个 continue 站点，每个站点是错误恢复的锚点。
+2. **通过 Continue 站点实现状态机**: `while(true)` + **8 个** continue 站点，每个站点是错误恢复的锚点（第 8 个是验证失败，见 `references/04-phase-agent-loop.md`）。
 3. **编译时特性门控**: `if (feature('FEATURE_X'))` // bundler 编译时求值，生产构建移除死代码。
 4. **缓存前缀稳定性**: 内置工具排序后作为稳定前缀，MCP 工具变化不影响缓存命中率。
 5. **纵深防御**: 6 层叠加使绕过概率指数下降——不是"信任 Agent"，而是"限制 Agent"。
@@ -358,6 +460,7 @@ LLM API（Anthropic Claude、OpenAI 等）的 Prompt Cache 按照**消息前缀*
 8. **层级化配置覆盖**: 7 级设置，CLI > Flag > Policy > Managed > Local > Project > User。
 9. **隔离的子 Agent 上下文**: 子 Agent 从空白消息列表开始，完成后只返回摘要——Token 节省 96%。
 10. **可逆性优先**: 文件编辑通过 Edit（替换字符串），不是 Write（覆盖）—— git diff 友好。
+11. **工具少而精，代码执行优于多次工具调用**: 与其编排一串细粒度工具调用，不如把逻辑封装成一次代码执行（如脚本/函数求值），减少往返与出错面。与 `references/03-phase-tools.md` 的 B2 改造联动。
 
 ---
 
@@ -371,3 +474,32 @@ LLM API（Anthropic Claude、OpenAI 等）的 Prompt Cache 按照**消息前缀*
 6. **MCP 工具默认使用 always_ask**: 第三方工具不应被自动信任。
 7. **Prompt Cache 有最小长度要求**: 约 1024 token，太短的前缀不会被缓存。
 8. **上下文压缩后必须主动恢复关键状态**: 文件内容、Skill 上下文、Plan、任务列表——压缩后的恢复提示必须精确。
+
+---
+
+## Skill / AGENTS.md / MCP 三者层次关系
+
+**何时读本节**：当你混淆"skill 教了什么"与"Agent 能做什么"，或不确定三层各自的职责边界时。
+
+三层是不同维度，不可互相替代：
+
+| 层 | 角色 | 形态 | 生命周期 |
+|----|------|------|---------|
+| Skill | 教怎么做 | 渐进式披露的能力包（markdown `references/` + 可选 `scripts/`） | 按需加载 |
+| MCP / 原生工具 | 提供能力 | 可被调用的具体执行接口 | 常驻注册 |
+| AGENTS.md | 给持久约束 | 项目级持久上下文与硬性边界 | 长期稳定 |
+
+**关键安全提示**：**持有 skill 不等于获得工具的授权。** Skill 本质是"伪装成文档的可执行内容"——`references/*.md` 可能含 prompt injection，随 skill 加载的 `scripts/` 以宿主凭据运行。是否真正能调用某个工具、能否越权，由 `references/01-phase-init.md` 的 AGENTS.md 生成规范与 `references/06-phase-permissions.md` 的权限模型决定，而非由 skill 的存在决定。
+
+- 与 `references/01-phase-init.md`（AGENTS.md 生成规范与 skills 三级加载契约）联动。
+- 与 `references/10-mcp-integration.md`（MCP 工具接入与错误处理）联动。
+
+---
+
+## 检查清单
+
+- [ ] 每个错误路径都声明了 `ErrorKind` 与幂等性（`idempotent: bool`）
+- [ ] 所有重试都挂在 `references/06-phase-permissions.md` 的 Budget 上，受 `max_attempts=5` 约束
+- [ ] 权限 deny 映射到 `human_required`，不进入 `retryable` 自动重试
+- [ ] permission deny 不允许"换路径重试"绕过安全不可变量
+- [ ] skill 加载时验证 `references/` 不含未授权的工具调用意图

@@ -200,11 +200,13 @@ Hook之间独立运行，一个Hook抛出异常不影响其他Hook执行。Hook�
 
 | 技术 | 启动时间 | 隔离强度 | 性能开销 | 适用场景 |
 |------|----------|----------|----------|----------|
-| **Docker** | 毫秒级（热容器） | 中等（共享内核） | 低 | Professional规模，单机/单租户 |
-| **Firecracker** | ~125ms | 高（microVM） | 中等 | Enterprise规模，多租户强隔离 |
-| **gVisor** | 毫秒级 | 中高（用户态内核） | 中等 | 需要Docker兼容但需更强隔离 |
-| **WebAssembly** | 微秒级 | 指令级隔离 | 极低 | 插件/小工具沙箱，性能敏感场景 |
-| **bubblewrap** | 毫秒级 | 中等 | 低 | Linux原生，Claude Code采用方案 |
+| **Docker** | 见 `references/12-sandbox-advanced.md` | 中等（共享内核） | 低 | Professional规模，单机/单租户 |
+| **Firecracker** | 见 `references/12-sandbox-advanced.md` | 高（microVM） | 中等 | Enterprise规模，多租户强隔离 |
+| **gVisor** | 见 `references/12-sandbox-advanced.md` | 中高（用户态内核） | 中等 | 需要Docker兼容但需更强隔离 |
+| **WebAssembly** | 见 `references/12-sandbox-advanced.md` | 指令级隔离 | 极低 | 插件/小工具沙箱，性能敏感场景 |
+| **bubblewrap** | 见 `references/12-sandbox-advanced.md` | 中等 | 低 | Linux原生，Claude Code采用方案 |
+
+> 启动时间等性能数据以 `references/12-sandbox-advanced.md` 为**单一事实源**，本文不重复保留易失真的数字（如 Docker 启动时间，12 记为 ~200ms；bubblewrap 记为 ~5ms）。
 
 **选型建议：**
 
@@ -215,6 +217,149 @@ Hook之间独立运行，一个Hook抛出异常不影响其他Hook执行。Hook�
 - 本地IDE Agent → bubblewrap（Claude Code路线验证），Linux宿主机原生支持
 
 **不可变约束**：无论选择哪种技术，沙箱配置文件路径必须硬编码为只读。Agent在任何情况下都不得修改沙箱启动参数或挂载点。
+
+---
+
+## 预算与成本控制（权限的第四个维度）
+
+**何时读本节**：当你需要限制 Agent 在一个任务 / 会话内能花多少 token、多少美元、多少个 turn、多少墙钟时间，并希望在逼近或突破上限时**自动降级**而非无限重试时，读本节。预算不是"能不能做"（Layer 1 权限模型），而是"还能花多少"——它是权限体系之外的第四个约束维度，与 Layer 1–6 正交。
+
+### 设计原理
+
+单一权限模型回答"这个操作能否执行"，但不回答"这样执行下去会花多少"。一个任务可能 3 步完成，也可能 30 步还完不成——**度量单位是 cost per task（每任务成本），不是 cost per token**。没有 tracing 就看不到成本罪魁：通常是臃肿的工具结果（大段未裁剪的 stdout）、冗余的验证轮次（同一事实反复确认）、未缓存的前缀（每次重复发送系统提示）。
+
+三条工程杠杆（路由实现见 `references/02-phase-llm.md` 的 ModelRouter）：
+
+1. **模型分层路由**：路由 / 工具选择 / 分类 / 简单步骤走小模型，前沿模型只留给真正难的推理。RouteLLM 一类方案报告在保持约 95% 质量的同时降本约 85%。
+2. **步数压缩**：ReWOO / plan-execute 把 10 次工具的任务从 11 次调用压到约 2 次，可预测工作流省 30–50%（代价是对意外返回适应性差）。
+3. **Batch API**：输入输出 5 折，适合评测跑批与夜间任务，可与 prompt caching 叠加。
+
+> **核心铁律**：预算必须**绑定动作**而不只是告警——只告警不动作的预算等于没有预算。
+
+### 抽象接口
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable
+
+
+class DegradeAction(Enum):
+    """预算预警与四级降级链的全部取值。"""
+    NO_OP = "no_op"                            # 未超限，无动作
+    WARN = "warn"                              # 预警（on_warning 默认，不阻断）
+    DOWNGRADE_MODEL = "downgrade_model"        # 降级链 L1：切到更便宜模型
+    STRIP_TOOLS_CONTEXT = "strip_tools_context"  # 降级链 L2：削减工具与上下文
+    PAUSE_FOR_HUMAN = "pause_for_human"        # 降级链 L3：暂停请求人工批准
+    TERMINATE_HANDOFF = "terminate_handoff"    # 降级链 L4：终止并产出交接
+
+
+@dataclass
+class Budget:
+    """单任务 / 会话的成本与资源上限。单位必须显式声明。"""
+    max_tokens: int = 0                    # 单位：token（含 prompt + completion），0 视为 unlimited
+    max_cost_usd: float = 0.0              # 单位：美元（USD），跨模型按各自单价折算
+    max_turns: int = 0                     # 单位：Agent 决策轮次（一次工具往返记 1 turn）
+    max_wall_clock_seconds: float = 0.0    # 单位：墙钟秒（真实流逝时间，含等待）
+    # ⚠ AI构建提示: 四字段至少填一个；max_tokens 与 max_cost_usd 建议同时约束，
+    # ⚠ AI构建提示: 避免单价突变导致 token 未超限但费用爆炸。
+
+
+@dataclass
+class BudgetPolicy:
+    """超限后的行为契约。on_warning 在逼近阈值时触发，on_exceeded 在突破阈值时触发。"""
+    warning_threshold: float = 0.8             # 用量达到该比例即触发 on_warning（0–1）
+    on_warning: DegradeAction = DegradeAction.WARN
+    on_exceeded: DegradeAction = DegradeAction.TERMINATE_HANDOFF
+    # ⚠ AI构建提示: on_exceeded 默认必须为降级链末级（TERMINATE_HANDOFF），
+    # ⚠ AI构建提示: 不可默认为 WARN，否则预算形同虚设。
+
+
+class BudgetController(ABC):
+    """预算控制核心。每个主循环检查点调用 check()，返回应执行的降级动作。"""
+
+    @abstractmethod
+    def attach_checkpoint(self, phase: str, hook: Callable) -> None:
+        """将检查点挂到主循环指定阶段（如 pre_action / post_action）。06 定义契约，Phase 4 实现。"""
+        raise NotImplementedError("AI: 在 Phase 4 主循环的 pre/post 处注册回调，回调内调用 check() 与 record_usage()")
+
+    @abstractmethod
+    def check(self, consumed: Budget, task_id: str) -> DegradeAction:
+        """评估当前用量，返回应执行的降级动作（NO_OP / WARN / 四级降级之一）。"""
+        raise NotImplementedError("AI: 取已消耗 token/cost/turns/seconds，与 Budget 四字段逐一比较；"
+                                  "未超限返回 NO_OP，逼近阈值返回 on_warning，突破返回 on_exceeded")
+
+    @abstractmethod
+    def record_usage(self, delta_tokens: int, delta_cost_usd: float,
+                     delta_turns: int, delta_seconds: float, model: str) -> None:
+        """由 tracing 在每个检查点上报增量用量；这是 cost-per-task 可观测的基础。"""
+        raise NotImplementedError("AI: 接 tracing，按 task_id 累加用量；模型路由切换后仍需持续上报，否则成本归因失真")
+```
+
+### 四级降级链
+
+预算突破后**逐级**收紧而非一步终止——给任务自救机会，但每级都有真实动作：
+
+```
+WARN（预警，on_warning 默认）: 写审计日志 + 推送通知(Slack/PagerDuty)，不阻断
+
+┌─ 降级链 L1  DOWNGRADE_MODEL ───── 经 ModelRouter 把后续步骤切到 cheap 模型
+├─ 降级链 L2  STRIP_TOOLS_CONTEXT ── 削减非核心工具(仅留白名单) + 裁剪上下文(丢弃陈旧工具结果)
+├─ 降级链 L3  PAUSE_FOR_HUMAN ────── 暂停并请求人工批准，不自动继续
+└─ 降级链 L4  TERMINATE_HANDOFF ──── 终止任务，产出阶段性交接(见 references/13-long-running-session.md)
+```
+
+四级降级链直接针对成本罪魁：L1 砍模型单价，L2 砍臃肿工具结果与冗余验证，L3/L4 在仍失控时停下来而非放任无限重试。
+
+### 挂到主循环的契约
+
+06 只定义契约，主循环实现由 Phase 4 负责：
+
+- **检查点**：`pre_action`（行动前，校验本步是否会突破预算）与 `post_action`（行动后，上报实际用量）。
+- **返回值消费**：`BudgetController.check()` 返回的 `DegradeAction` 由主循环解释执行；`WARN` 不阻断，`TERMINATE_HANDOFF` 触发 handoff。
+- **与护栏子循环协同**：预算检查是「安全护栏子循环」Pre-Action 阶段 `budget_limit` 规则的具体实现（见下文 v4 章节）。
+- **错误分类**：预算终止属于不可自动恢复错误，**不进入 REPLAN 的可自动重试集合**；错误分类权威定义见 `references/08-core-concepts.md`。
+
+### 三档差异表
+
+| 维度 | Minimal | Professional | Enterprise |
+|------|---------|--------------|------------|
+| Budget 字段 | 仅 `max_turns` | `max_turns` + `max_cost_usd` | 四字段全约束 |
+| 降级链 | 仅 WARN 告警 | L1–L2 | L1–L4 全链 |
+| 模型路由 | 无（单模型） | `on_exceeded` → DOWNGRADE_MODEL | 动态 RouterLLM 式路由 |
+| 步数压缩 | 无 | plan-execute 可选 | ReWOO / plan-execute 默认开启 |
+| Batch API | 不启用 | 夜间跑批启用 | 评测 + 夜间全量启用 |
+| tracing | 无（无法定位罪魁） | 基础用量日志 | 全量 tracing + 成本归因面板 |
+
+### AI 构建提示
+
+```
+根据用户选择的规模实现预算控制：
+
+Minimal：
+  1. 仅实现 max_turns 计数，超限即终止并写日志
+  2. 不引入 tracing、不做模型路由
+
+Professional：
+  1. 实现 Budget / BudgetPolicy 骨架与 BudgetController.check()
+  2. on_warning=WARN, on_exceeded 触发 DOWNGRADE_MODEL
+  3. 接 ModelRouter（见 02）做后续步骤降级
+  4. post_action 上报用量到基础日志
+
+Enterprise：
+  1. 四字段同时约束，默认 on_exceeded=TERMINATE_HANDOFF
+  2. 接全量 tracing，按 task_id 归因（识别臃肿工具结果/冗余验证/未缓存前缀）
+  3. ReWOO/plan-execute 压缩步数，Batch API 跑批
+  4. TERMINATE_HANDOFF 调用 references/13-long-running-session.md 的交接契约
+  5. 预算超限一律绑定动作，禁止"只告警"
+
+关键约束：
+  □ 预算必须绑定动作，不得只告警（核心铁律）
+  □ max_cost_usd 与 max_tokens 建议同时约束
+  □ 模型切换后仍持续上报用量，否则 cost-per-task 失真
+  □ 预算终止不进入 REPLAN 自动重试集合
+```
 
 ---
 
@@ -416,7 +561,7 @@ class SafetyGuardLoop:
 | 规则 | 严重级别 | 说明 |
 |------|---------|------|
 | `block_destructive` | critical | 阻断对关键路径的破坏性操作（`/etc/`, `C:\Windows\`, `.git/`, `production/`） |
-| `budget_limit` | high | 检查行动是否超出预算上限 |
+| `budget_limit` | high | 检查行动是否超出预算上限（定义与降级链见上文「预算与成本控制」） |
 | `permission_check` | critical | 验证 Agent 对该操作的权限 |
 | `rate_limit` | high | 检查 API 调用频率限制 |
 
@@ -429,21 +574,22 @@ class SafetyGuardLoop:
 | `output_size` | medium | 验证输出大小在限制内 |
 | `compliance` | high | 对照合规策略检查输出内容 |
 
-## 与现有 6 层纵深防御的关系
+## 安全护栏子循环与既有 6 层模型的映射
 
-安全护栏子循环作为现有 6 层防御的 **Layer 2.5**——介于权限检查（Layer 2）和沙箱隔离（Layer 3）之间：
+> v4 不引入第二套层编号。下方「6 层模型在 v4 技术下的映射表」把安全护栏子循环的能力挂到主文体定义的 Layer 1–6 上，避免双层编号打架。主文体 6 层定义见上文「纵深防御架构」（Layer 1 权限模型 → Layer 6 硬编码拒绝）。
 
-```
-Layer 1: 输入验证
-Layer 2: 权限模型（5 种模式 × 7 级规则）
-Layer 2.5: 安全护栏子循环 ← v4 新增
-Layer 3: 沙箱隔离（Docker / Firecracker）
-Layer 4: 网络策略
-Layer 5: 审计日志
-Layer 6: 告警与响应
-```
+| 安全护栏子循环组件 | 命中的既有层 | 说明 |
+|---|---|---|
+| Pre-Action: `permission_check` | Layer 1 权限模型 | 行动前重新走 Layer 1 规则链，deny 优先级不可变量 |
+| Pre-Action: `budget_limit` | 预算与成本控制（权限第四维度，见上文） | 行动前校验 cost-per-task 是否突破 Budget |
+| Pre-Action: `block_destructive` | Layer 6 硬编码拒绝 | 关键路径破坏性操作直接 BLOCK |
+| Pre-Action: `rate_limit` | 跨层（Layer 1 之上） | API 频控，独立于权限但同处 Pre-Action |
+| Post-Action: `no_secrets` / `pii_detection` / `compliance` | Layer 5 审计日志 | 行动后扫描并写入审计，命中则 REDACT/BLOCK |
+| 整个子循环 | 跨 Layer 1 ↔ Layer 5 的检查点 | 不是新层，而是挂在主循环每个行动前后的检查点 |
 
-**与 Layer 2 的差异**：Layer 2 是静态规则链（"这个操作能否执行"），Layer 2.5 是动态上下文感知（"在当前状态下，这个操作是否安全"）。
+**与 Layer 2（AI 分类器）的差异**：Layer 2 是静态规则链（"这个操作能否执行"），安全护栏子循环是动态上下文感知（"在当前状态下，这个操作是否安全"），二者都挂在 Layer 1 的不可变量之下，不另立层号。
+
+**A3 联动（安全默认值，保守方向）**：安全护栏 / Hook 超时**默认降级为 DENY**（或升级为人工审批），不得 ALLOW，以守住 Layer 1 硬编码 deny 不可被绕过的铁律。permission deny（含 Layer 1 硬编码拒绝与 settings deny）属于不可自动恢复错误，**不进入 REPLAN 的可自动重试集合**；错误分类权威定义见 `references/08-core-concepts.md`。
 
 ## 规模适配
 
@@ -470,8 +616,9 @@ Enterprise 级别：
   5. 安全事件日志定期写入 WAL，支持审计回溯
 
 关键约束：
-  □ 安全护栏检查不得阻塞主循环超过 50ms（超时则放行 + 记录告警）
+  □ 安全护栏检查（含 Hook 拦截）不得阻塞主循环超过 50ms——**超时默认降级为 DENY（或升级为人工审批），不得 ALLOW**，以守住 Layer 1 硬编码 deny 不可被绕过（见上方「A3 联动」）
   □ 敏感信息扫描使用正则匹配，不调用 LLM（避免 Token 开销）
   □ BLOCK 判定必须记录完整的审计日志（action / rule / verdict / timestamp）
   □ 安全规则支持热更新（从配置中心加载，不重启 Agent）
+  □ permission deny 不进入 REPLAN 可自动重试集合（错误分类见 references/08-core-concepts.md）
 ```
